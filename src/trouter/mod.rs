@@ -5,6 +5,7 @@
 
 pub mod registrar;
 pub mod session;
+pub mod subscription;
 pub mod websocket;
 
 use anyhow::{Context, Result};

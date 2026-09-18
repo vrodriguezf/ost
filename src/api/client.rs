@@ -11,6 +11,9 @@ const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const DEFAULT_CHAT_SERVICE: &str = "https://amer.ng.msg.teams.microsoft.com";
 const CHATSVCAGG: &str = "https://chatsvcagg.teams.microsoft.com";
 
+// Push reconnects and API refreshes share refresh-token rotation on disk.
+static AUTH_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Authenticated client that handles both Graph (AAD) and Teams (Skype) APIs.
 pub struct TeamsClient {
     http: reqwest::Client,
@@ -20,11 +23,13 @@ pub struct TeamsClient {
 impl TeamsClient {
     /// Load config and build client. Attempts token refresh if AAD token is expired.
     pub async fn new() -> Result<Self> {
+        let _refresh_guard = AUTH_REFRESH_LOCK.lock().await;
         let mut config = Config::load()?;
 
         // Auto-refresh if any token is expired but refresh token exists
         let needs_refresh = config.get_access_token().map_or(true, |t| t.is_expired())
-            || config.get_graph_token().map_or(true, |t| t.is_expired());
+            || config.get_graph_token().map_or(true, |t| t.is_expired())
+            || config.get_skype_token().map_or(true, |t| t.is_expired());
         if needs_refresh {
             if config.get_refresh_token().is_some() {
                 tracing::info!("Tokens missing or expired, refreshing...");
@@ -46,7 +51,9 @@ impl TeamsClient {
         }
 
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()?,
             config,
         })
     }
@@ -62,7 +69,7 @@ impl TeamsClient {
         Ok(token.token)
     }
 
-    fn skype_token(&self) -> Result<String> {
+    pub(crate) fn skype_token(&self) -> Result<String> {
         let token = self
             .config
             .get_skype_token()
@@ -71,6 +78,22 @@ impl TeamsClient {
             bail!("Skype token expired. Run 'teams-cli login'.");
         }
         Ok(token.token)
+    }
+
+    /// Rotate the push session before the token enters its refresh window.
+    pub(crate) fn push_session_lifetime(&self) -> std::time::Duration {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let seconds = self
+            .config
+            .get_skype_token()
+            .and_then(|token| token.expires_at)
+            .map(|expiry| expiry.saturating_sub(now.saturating_add(300)))
+            .unwrap_or(900)
+            .clamp(1, 900);
+        std::time::Duration::from_secs(seconds)
     }
 
     /// GET request to Microsoft Graph API (bearer auth with Graph token).

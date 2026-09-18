@@ -24,7 +24,7 @@ impl TrouterSocket {
             .replace("https://", "wss://")
             .replace("http://", "ws://");
 
-        tracing::info!("Connecting WebSocket to {}", ws_url);
+        tracing::info!("Connecting Trouter WebSocket");
 
         let (stream, response) = connect_async(&ws_url)
             .await
@@ -37,7 +37,7 @@ impl TrouterSocket {
 
     /// Send a text frame.
     pub async fn send_text(&mut self, msg: &str) -> Result<()> {
-        tracing::debug!("WS send: {}", msg);
+        tracing::debug!("WS send ({} bytes)", msg.len());
         self.stream
             .send(Message::Text(msg.to_string()))
             .await
@@ -55,15 +55,16 @@ impl TrouterSocket {
         loop {
             match self.stream.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    tracing::debug!("WS recv: {}", text);
+                    tracing::debug!("WS recv ({} bytes)", text.len());
 
                     // Auto-respond to Trouter data frame deliveries (3::: HTTP-over-WS)
                     if let Some(req_id) = extract_trouter_request_id(&text) {
                         let resp = format!("3:::{{\"id\":{},\"status\":200}}", req_id);
                         tracing::debug!("Trouter response: {}", resp);
-                        if let Err(e) = self.stream.send(Message::Text(resp)).await {
-                            tracing::warn!("Failed to send Trouter response: {:#}", e);
-                        }
+                        self.stream
+                            .send(Message::Text(resp))
+                            .await
+                            .context("Failed to acknowledge Trouter delivery")?;
                     }
 
                     // Auto-ack Socket.IO event frames (5:ID::)
@@ -71,9 +72,10 @@ impl TrouterSocket {
                     if let Some(ack_id) = extract_socketio_ack_id(&text) {
                         let ack = format!("6:{}::", ack_id);
                         tracing::debug!("Socket.IO ack: {}", ack);
-                        if let Err(e) = self.stream.send(Message::Text(ack)).await {
-                            tracing::warn!("Failed to send Socket.IO ack: {:#}", e);
-                        }
+                        self.stream
+                            .send(Message::Text(ack))
+                            .await
+                            .context("Failed to acknowledge Socket.IO delivery")?;
                     }
 
                     return Ok(Some(text));

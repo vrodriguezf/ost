@@ -41,9 +41,43 @@ pub async fn register(
     registrar_url: &str,
     trouter_surl: &str,
 ) -> Result<()> {
+    register_entries(
+        http,
+        skype_token,
+        registrar_url,
+        trouter_surl,
+        REGISTRATIONS,
+    )
+    .await
+}
+
+/// Subscribe only to messaging. The TUI never registers a calling endpoint.
+pub async fn register_messages(
+    http: &reqwest::Client,
+    skype_token: &str,
+    registrar_url: &str,
+    trouter_surl: &str,
+) -> Result<()> {
+    register_entries(
+        http,
+        skype_token,
+        registrar_url,
+        trouter_surl,
+        &REGISTRATIONS[..1],
+    )
+    .await
+}
+
+async fn register_entries(
+    http: &reqwest::Client,
+    skype_token: &str,
+    registrar_url: &str,
+    trouter_surl: &str,
+    entries: &[RegEntry],
+) -> Result<()> {
     let url = registrar_url.trim_end_matches('/').to_string();
 
-    for entry in REGISTRATIONS {
+    for entry in entries {
         let reg_id = uuid::Uuid::new_v4().to_string();
         let path = format!("{}{}", trouter_surl, entry.path_suffix);
 

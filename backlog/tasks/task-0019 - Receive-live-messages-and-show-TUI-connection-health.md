@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@codex-live'
 created_date: '2026-09-18 11:52'
-updated_date: '2026-09-18 11:52'
+updated_date: '2026-09-18 12:01'
 labels:
   - tui
   - feature
@@ -45,4 +45,6 @@ Complete the deferred live reception from TASK-0002 so the TUI refreshes incomin
 
 <!-- SECTION:NOTES:BEGIN -->
 Implementation and three parallel feature branches approved by the user. Shared event contract will be coordinated with unread and notification agents.
+
+Shared activity contract committed and compiled. Implemented message-only Trouter registration with setup/heartbeat deadlines, cancellation and bounded reconnect; token renewal now covers Skype expiry and serializes refresh rotation. Backend coalesces chat invalidations, fetches authoritative messages, and suppresses baseline history/replayed events. Message viewport work and offline tests in progress.
 <!-- SECTION:NOTES:END -->

@@ -22,6 +22,13 @@ struct Conversation {
     thread_properties: Option<ThreadProperties>,
     #[serde(rename = "lastMessage")]
     last_message: Option<NativeMessage>,
+    properties: Option<ConversationProperties>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationProperties {
+    /// Native read watermark: message ID; timestamp; service flags.
+    consumptionhorizon: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +52,7 @@ struct NativeMessage {
     content: Option<String>,
     messagetype: Option<String>,
     from: Option<String>,
+    properties: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +200,12 @@ pub struct ChatInfo {
     pub id: String,
     pub name: String,
     pub is_group: bool,
+    pub last_message_id: Option<String>,
+    pub last_message_sender_id: Option<String>,
+    pub last_message_type: Option<String>,
+    /// None when the native API supplies only a read watermark.
+    pub unread_count: Option<u32>,
+    pub has_unread: Option<bool>,
     pub last_message_time: Option<String>,
     pub last_message_sender: Option<String>,
     pub last_message_preview: Option<String>,
@@ -206,6 +220,25 @@ pub struct MessageInfo {
     pub timestamp: String,
     pub content: String,
     pub mentions: Vec<String>,
+}
+
+/// The native consumption horizon identifies the newest consumed message. It
+/// establishes only some unread activity, never a count of historical messages.
+fn native_has_unread(conversation: &Conversation) -> Option<bool> {
+    let horizon = conversation
+        .properties
+        .as_ref()?
+        .consumptionhorizon
+        .as_deref()?;
+    let read_id = horizon.split(';').next()?.trim().parse::<u64>().ok()?;
+    let message_id = conversation
+        .last_message
+        .as_ref()?
+        .id
+        .as_deref()?
+        .parse::<u64>()
+        .ok()?;
+    Some(message_id > read_id)
 }
 
 /// List recent chats and return structured data.
@@ -290,6 +323,14 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
             id,
             name,
             is_group,
+            last_message_id: conv.last_message.as_ref().and_then(|m| m.id.clone()),
+            last_message_sender_id: conv.last_message.as_ref().and_then(|m| m.from.clone()),
+            last_message_type: conv
+                .last_message
+                .as_ref()
+                .and_then(|m| m.messagetype.clone()),
+            unread_count: None,
+            has_unread: native_has_unread(conv),
             last_message_time: last_time,
             last_message_sender: last_sender,
             last_message_preview: last_preview,
@@ -352,9 +393,113 @@ pub async fn read_messages_data(
             sender,
             timestamp: time,
             content: text.trim().to_string(),
-            mentions: Vec::new(),
+            mentions: explicit_mentions(msg.properties.as_ref()),
         });
     }
 
+    // Never rely on page order or repeat duplicate service IDs in the view.
+    result.sort_by(|left, right| {
+        message_sort_key(&left.timestamp, &left.id)
+            .cmp(&message_sort_key(&right.timestamp, &right.id))
+    });
+    let mut seen = std::collections::HashSet::new();
+    result.retain(|message| message.id.is_empty() || seen.insert(message.id.clone()));
     Ok(result)
+}
+
+/// Chronological key with a numeric ID tie-breaker (service IDs are milliseconds).
+pub(crate) fn message_sort_key(timestamp: &str, id: &str) -> (i64, u64, String) {
+    let time = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|time| time.timestamp_millis())
+        .or_else(|| id.parse().ok())
+        .unwrap_or(0);
+    (time, id.parse().unwrap_or(0), id.to_string())
+}
+
+/// Native Teams encodes properties.mentions as either an array or a JSON string.
+/// Numeric itemid/<at id> values are local indices, never user identities.
+fn explicit_mentions(properties: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(value) = properties.and_then(|value| value.get("mentions")) else {
+        return Vec::new();
+    };
+    let decoded;
+    let value = if let Some(text) = value.as_str() {
+        decoded = serde_json::from_str::<serde_json::Value>(text).unwrap_or_default();
+        &decoded
+    } else {
+        value
+    };
+    let mut mentions: Vec<_> = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|mention| mention.get("mri").and_then(serde_json::Value::as_str))
+        .filter(|mri| !mri.is_empty())
+        .map(String::from)
+        .collect();
+    mentions.sort();
+    mentions.dedup();
+    mentions
+}
+
+#[cfg(test)]
+mod live_message_tests {
+    use super::*;
+    #[test]
+    fn native_mentions_use_identity_not_index() {
+        let props = serde_json::json!({"mentions": "[{\"mri\":\"8:orgid:other\",\"itemid\":\"0\"},{\"itemid\":\"1\"}]"});
+        assert_eq!(explicit_mentions(Some(&props)), vec!["8:orgid:other"]);
+        let props = serde_json::json!({"mentions":[{"mri":"8:orgid:other"}]});
+        assert_eq!(explicit_mentions(Some(&props)), vec!["8:orgid:other"]);
+        assert!(explicit_mentions(None).is_empty());
+    }
+    #[test]
+    fn numeric_message_ids_break_timestamp_ties() {
+        assert!(
+            message_sort_key("2026-01-01T00:00:00Z", "9")
+                < message_sort_key("2026-01-01T00:00:00Z", "10")
+        );
+    }
+}
+
+#[cfg(test)]
+mod unread_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn native_consumption_horizon_distinguishes_unread_without_counting_history() {
+        let conversation = |horizon: &str, message: &str| {
+            serde_json::from_value::<Conversation>(serde_json::json!({
+                "id": "chat", "properties": { "consumptionhorizon": horizon },
+                "lastMessage": { "id": message }
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            native_has_unread(&conversation(
+                "1726653600000;1726653600000; 1",
+                "1726653600001"
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            native_has_unread(&conversation(
+                "1726653600001;1726653600000;0",
+                "1726653600001"
+            )),
+            Some(false)
+        );
+        assert_eq!(
+            native_has_unread(&conversation("invalid", "1726653600001")),
+            None
+        );
+        assert_eq!(
+            native_has_unread(&conversation("1726653600000;0;0", "opaque")),
+            None
+        );
+        let missing: Conversation =
+            serde_json::from_value(serde_json::json!({"id":"chat"})).unwrap();
+        assert_eq!(native_has_unread(&missing), None);
+    }
 }

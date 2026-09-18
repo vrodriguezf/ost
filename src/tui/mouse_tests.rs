@@ -93,7 +93,7 @@ impl Harness {
                 name: format!("Chat {i:02}"),
                 id: format!("chat-{i}"),
                 is_group: false,
-                unread: 0,
+                unread: Default::default(),
                 online: false,
             })
             .collect();
@@ -107,7 +107,7 @@ impl Harness {
             channels: vec![Channel {
                 name: "Channel One".into(),
                 id: "channel-1".into(),
-                unread: 0,
+                unread: Default::default(),
             }],
         });
     }
@@ -134,6 +134,8 @@ fn row_text(buffer: &Buffer, y: u16) -> String {
 
 fn message(content: &str) -> Message {
     Message {
+        id: content.into(),
+        sender_id: "other".into(),
         sender: "Sender".into(),
         timestamp: "12:34".into(),
         content: content.into(),
@@ -202,6 +204,11 @@ fn clicks_after_backend_reorder_open_the_displayed_chat() {
             id: format!("chat-{i}"),
             name: format!("Chat {i:02}"),
             is_group: false,
+            last_message_id: None,
+            last_message_sender_id: None,
+            last_message_type: None,
+            unread_count: None,
+            has_unread: None,
             last_message_time: None,
             last_message_sender: None,
             last_message_preview: None,

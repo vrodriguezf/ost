@@ -38,6 +38,8 @@ pub struct Attachment {
 /// A single chat message.
 #[derive(Clone)]
 pub struct Message {
+    pub id: String,
+    pub sender_id: String,
     /// Sender display name.
     pub sender: String,
     /// Timestamp string (e.g., "9:15 AM today").
@@ -68,6 +70,8 @@ pub struct MessagesState {
     pub expanded_threads: Vec<bool>,
     /// Whether messages are being loaded.
     pub loading: bool,
+    scroll_anchor: Option<(String, usize)>,
+    restore_anchor: bool,
 }
 
 impl Default for MessagesState {
@@ -79,31 +83,77 @@ impl Default for MessagesState {
             viewport: Viewport::default(),
             selected: 0,
             loading: false,
+            scroll_anchor: None,
+            restore_anchor: false,
         }
     }
 }
 
 impl MessagesState {
-    /// Update messages from API response.
+    /// Merge an authoritative page by ID, retaining older displayed history.
+    /// Background updates keep the reading anchor and selected message intact.
     pub fn update_messages(&mut self, header: &str, api_messages: Vec<api::MessageInfo>) {
+        let initial = self.loading || self.channel_header != header || self.messages.is_empty();
+        let follow_latest = initial
+            || (self.viewport.follow_selection
+                && self.selected == self.messages.len().saturating_sub(1));
+        let selected_id = self
+            .messages
+            .get(self.selected)
+            .map(|message| message.id.clone());
         self.channel_header = header.to_string();
-        self.messages = api_messages
-            .into_iter()
-            .map(|m| Message {
-                sender: m.sender,
-                timestamp: m.timestamp,
-                content: m.content,
-                reactions: Vec::new(),
-                reply_count: 0,
-                replies: Vec::new(),
-                attachments: Vec::new(),
-            })
-            .collect();
-        let count = self.messages.len();
-        self.expanded_threads = vec![true; count];
-        self.viewport = Viewport::default();
-        // Select the last (newest) message so the view starts at the bottom.
-        self.selected = count.saturating_sub(1);
+        if initial {
+            self.messages.clear();
+            self.expanded_threads.clear();
+            self.viewport = Viewport::default();
+            self.scroll_anchor = None;
+        }
+        for message in api_messages {
+            let id = if message.id.is_empty() {
+                format!(
+                    "{}|{}|{}",
+                    message.sender_id, message.timestamp, message.content
+                )
+            } else {
+                message.id
+            };
+            if let Some(existing) = self.messages.iter_mut().find(|existing| existing.id == id) {
+                existing.sender_id = message.sender_id;
+                existing.sender = message.sender;
+                existing.timestamp = message.timestamp;
+                existing.content = message.content;
+            } else {
+                let key = crate::api::message_sort_key(&message.timestamp, &id);
+                let position = self.messages.partition_point(|existing| {
+                    crate::api::message_sort_key(&existing.timestamp, &existing.id) <= key
+                });
+                self.messages.insert(
+                    position,
+                    Message {
+                        id,
+                        sender_id: message.sender_id,
+                        sender: message.sender,
+                        timestamp: message.timestamp,
+                        content: message.content,
+                        reactions: Vec::new(),
+                        reply_count: 0,
+                        replies: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                );
+                self.expanded_threads.insert(position, true);
+            }
+        }
+        // API pages arrive chronologically. Existing history keeps its order;
+        // replayed pages update in place rather than removing newer messages.
+        self.selected = if follow_latest {
+            self.messages.len().saturating_sub(1)
+        } else {
+            selected_id
+                .and_then(|id| self.messages.iter().position(|message| message.id == id))
+                .unwrap_or(self.selected.min(self.messages.len().saturating_sub(1)))
+        };
+        self.restore_anchor = !initial && !self.viewport.follow_selection;
         self.loading = false;
     }
 
@@ -226,6 +276,17 @@ pub fn render(
     let total_lines = all_lines.len();
     let visible_height = messages_area.height as usize;
 
+    if state.restore_anchor {
+        if let Some((id, within)) = &state.scroll_anchor {
+            if let Some(index) = state.messages.iter().position(|message| &message.id == id) {
+                if let Some((start, end)) = msg_line_ranges.get(index) {
+                    state.viewport.offset = start + (*within).min(end.saturating_sub(*start));
+                }
+            }
+        }
+        state.restore_anchor = false;
+    }
+
     // Auto-scroll to keep selected message visible.
     let (start, end) = msg_line_ranges
         .get(state.selected)
@@ -235,6 +296,16 @@ pub fn render(
         .viewport
         .prepare(total_lines, visible_height, start..end);
     let scroll = state.viewport.offset;
+    state.scroll_anchor = msg_line_ranges
+        .iter()
+        .enumerate()
+        .find(|(_, (_, end))| *end > scroll)
+        .map(|(index, (start, _))| {
+            (
+                state.messages[index].id.clone(),
+                scroll.saturating_sub(*start),
+            )
+        });
 
     // Use the very same line ranges as the renderer, including wrapped replies.
     // The separating blank line is deliberately not a message click target.

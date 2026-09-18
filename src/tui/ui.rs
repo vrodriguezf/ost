@@ -134,11 +134,7 @@ fn render_header(area: Rect, buf: &mut Buffer, app: &mut App) {
     let help_indicator = Span::styled(" [?] Help ", Style::default().fg(Color::Gray));
 
     let (status_symbol, status_color) = status_indicator(app.is_online);
-    let status_text = if app.is_online {
-        "online".to_string()
-    } else {
-        app.connection_state.clone()
-    };
+    let status_text = format!("{} ({})", app.connection_state, app.presence);
     let online_status = Span::styled(
         format!(" {} {} ", status_symbol, status_text),
         Style::default().fg(status_color),

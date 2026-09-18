@@ -11,6 +11,7 @@ use crossterm::{
 use ratatui::DefaultTerminal;
 use tokio_stream::StreamExt;
 
+use super::activity::ConnectionState;
 use super::backend::{Backend, BackendCommand, BackendResponse};
 use super::compose::ComposeState;
 use super::debug_log::DebugLogState;
@@ -18,7 +19,7 @@ use super::log_capture::LogBuffer;
 use super::messages::MessagesState;
 use super::mouse::{is_actionable, HitMap, Target, WHEEL_LINES};
 use super::notifications::{NotificationContext, NotificationPolicy, NotificationService};
-use super::search::SearchState;
+use super::search::{SearchResultKind, SearchState};
 use super::sidebar::SidebarState;
 use super::ui;
 
@@ -47,6 +48,8 @@ pub struct App {
     pub should_exit: bool,
     /// Online status (for display)
     pub is_online: bool,
+    /// Teams presence is independent of push connection health.
+    pub presence: String,
     /// Current user name
     pub user_name: String,
     /// Stable Graph/MRI identity, used to suppress notifications for our messages.
@@ -92,6 +95,7 @@ impl App {
         Self {
             should_exit: false,
             is_online: false,
+            presence: "unknown".into(),
             user_name: "Loading...".to_string(),
             current_user_id: None,
             terminal_focused: false,
@@ -585,13 +589,27 @@ impl App {
     /// Handle a response from the async backend.
     fn handle_backend_response(&mut self, response: BackendResponse, backend: &Backend) {
         self.mouse.clear();
+        let selected_search_key = self.search_selected_key();
+        let selected_search = self.search.selected;
+        let search_offset = self.search.viewport.offset;
         match response {
+            // Activity consumers (unread and notifications) attach here. The
+            // selected history follows as an authoritative Messages response.
             BackendResponse::IncomingMessage(message) => self.notify_incoming(&message),
-            BackendResponse::ConnectionState(_) => {}
+            BackendResponse::ConnectionState(state) => {
+                self.is_online = state == ConnectionState::Connected;
+                self.connection_state = match state {
+                    ConnectionState::Connecting => "Connecting push...".into(),
+                    ConnectionState::Connected => "Live".into(),
+                    ConnectionState::Reconnecting { retry_in_secs } => {
+                        format!("Reconnecting in {retry_in_secs}s; polling")
+                    }
+                    ConnectionState::Degraded(reason) => format!("Degraded: {reason}"),
+                };
+            }
             BackendResponse::Teams(Ok(teams)) => {
                 self.sidebar.update_teams(teams);
                 self.sidebar.loading = false;
-                self.close_stale_search();
                 // If this is the first data load and we have teams, select the first
                 // selectable item (skip TeamsHeader).
                 if self.sidebar.selected == 0 {
@@ -605,7 +623,6 @@ impl App {
             BackendResponse::Chats(Ok(chats)) => {
                 self.sidebar.update_chats(chats);
                 self.sidebar.loading = false;
-                self.close_stale_search();
             }
             BackendResponse::Chats(Err(e)) => {
                 self.set_error(format!("Failed to load chats: {:#}", e));
@@ -618,7 +635,6 @@ impl App {
                         Ok(msgs) => {
                             let header = self.messages.channel_header.clone();
                             self.messages.update_messages(&header, msgs);
-                            self.close_stale_search();
                         }
                         Err(e) => {
                             self.messages.loading = false;
@@ -649,27 +665,30 @@ impl App {
                 self.set_error(format!("Failed to load user info: {:#}", e));
             }
             BackendResponse::Presence(Ok(presence)) => {
-                let is_online = presence.availability != "Offline"
-                    && presence.availability != "PresenceUnknown";
-                self.is_online = is_online;
-                self.connection_state = if is_online {
-                    "Connected".to_string()
-                } else {
-                    format!("Status: {}", presence.availability)
-                };
+                self.presence = presence.availability;
             }
             BackendResponse::Presence(Err(e)) => {
                 tracing::debug!("Failed to load presence: {:#}", e);
-                // Presence failure is non-critical; don't show error in status bar.
-                self.connection_state = "Connected".to_string();
-                self.is_online = true;
+                self.presence = "unknown".into();
             }
             BackendResponse::ClientError(msg) => {
                 self.connection_state = "Not authenticated".to_string();
                 self.is_online = false;
                 self.sidebar.loading = false;
+                self.messages.loading = false;
                 self.set_error(format!("Auth: {}", msg));
             }
+        }
+        if self.search.active {
+            self.search.update_results(&self.sidebar, &self.messages);
+            self.search.selected = selected_search_key
+                .and_then(|key| {
+                    self.search.results.iter().position(|result| {
+                        self.search_result_key(&result.kind).as_deref() == Some(&key)
+                    })
+                })
+                .unwrap_or(selected_search.min(self.search.results.len().saturating_sub(1)));
+            self.search.viewport.offset = search_offset;
         }
     }
 
@@ -703,13 +722,31 @@ impl App {
         }
     }
 
-    /// Close the search overlay if it's open.
-    ///
-    /// Called when backend data arrives to prevent stale search result indices
-    /// from pointing at the wrong sidebar/message items.
-    fn close_stale_search(&mut self) {
-        if self.search.active {
-            self.search.deactivate();
+    /// Stable result identity, captured before background data changes indices.
+    fn search_selected_key(&self) -> Option<String> {
+        self.search
+            .selected_result()
+            .and_then(|result| self.search_result_key(&result.kind))
+    }
+
+    fn search_result_key(&self, kind: &SearchResultKind) -> Option<String> {
+        match *kind {
+            SearchResultKind::Chat(index) => self
+                .sidebar
+                .chats
+                .get(index)
+                .map(|chat| format!("chat:{}", chat.id)),
+            SearchResultKind::Channel(team, channel) => self
+                .sidebar
+                .teams
+                .get(team)
+                .and_then(|team| team.channels.get(channel))
+                .map(|channel| format!("channel:{}", channel.id)),
+            SearchResultKind::Message(index) => self
+                .messages
+                .messages
+                .get(index)
+                .map(|message| format!("message:{}", message.id)),
         }
     }
 
@@ -813,6 +850,7 @@ async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Resul
         }
     }
 
+    backend.shutdown().await;
     Ok(())
 }
 
