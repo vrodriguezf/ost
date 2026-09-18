@@ -27,9 +27,9 @@ impl TeamsClient {
         let mut config = Config::load()?;
 
         // Auto-refresh if any token is expired but refresh token exists
-        let needs_refresh = config.get_access_token().map_or(true, |t| t.is_expired())
-            || config.get_graph_token().map_or(true, |t| t.is_expired())
-            || config.get_skype_token().map_or(true, |t| t.is_expired());
+        let needs_refresh = config.get_access_token().is_none_or(|t| t.is_expired())
+            || config.get_graph_token().is_none_or(|t| t.is_expired())
+            || config.get_skype_token().is_none_or(|t| t.is_expired());
         if needs_refresh {
             if config.get_refresh_token().is_some() {
                 tracing::info!("Tokens missing or expired, refreshing...");

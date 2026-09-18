@@ -125,6 +125,7 @@ impl PendingChats {
 #[derive(Default)]
 struct Cursor {
     watermark: i64,
+    highest_id: u64,
     seen: VecDeque<String>,
 }
 
@@ -148,8 +149,11 @@ impl ActivityTracker {
     fn reconcile_chats(&mut self, chats: &[api::ChatInfo], pending: &mut PendingChats) {
         for chat in chats {
             let signature = format!(
-                "{:?}|{:?}|{:?}",
-                chat.last_message_time, chat.last_message_sender, chat.last_message_preview
+                "{:?}|{:?}|{:?}|{:?}",
+                chat.last_message_id,
+                chat.last_message_time,
+                chat.last_message_sender,
+                chat.last_message_preview
             );
             let previous = self.summaries.insert(chat.id.clone(), signature.clone());
             if !self.initialized {
@@ -160,7 +164,13 @@ impl ActivityTracker {
                             .last_message_time
                             .as_deref()
                             .and_then(timestamp_millis)
-                            .unwrap_or(self.started_at),
+                            .unwrap_or(self.started_at)
+                            .max(self.started_at),
+                        highest_id: chat
+                            .last_message_id
+                            .as_deref()
+                            .and_then(|id| id.parse().ok())
+                            .unwrap_or(0),
                         ..Cursor::default()
                     });
             } else if previous.as_deref() != Some(&signature) {
@@ -186,19 +196,33 @@ impl ActivityTracker {
         } else {
             self.started_at
         };
+        let initial_highest_id = if opening {
+            messages
+                .iter()
+                .filter_map(|message| message.id.parse::<u64>().ok())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let cursor = self
             .cursors
             .entry(chat_id.to_string())
             .or_insert_with(|| Cursor {
                 watermark: baseline,
+                highest_id: initial_highest_id,
                 ..Cursor::default()
             });
         let previous_watermark = cursor.watermark;
+        let previous_id = cursor.highest_id;
         let mut incoming = Vec::new();
         for message in messages {
             let time = message_time(message).unwrap_or(previous_watermark);
             if !message.id.is_empty() && !cursor.seen.contains(&message.id) {
-                if time > previous_watermark {
+                if time > previous_watermark
+                    || (time == previous_watermark
+                        && message.id.parse::<u64>().is_ok_and(|id| id > previous_id))
+                {
                     incoming.push(IncomingMessage {
                         chat_id: chat_id.to_string(),
                         id: message.id.clone(),
@@ -215,6 +239,7 @@ impl ActivityTracker {
                 }
             }
             cursor.watermark = cursor.watermark.max(time);
+            cursor.highest_id = cursor.highest_id.max(message.id.parse().unwrap_or(0));
         }
         incoming
     }
@@ -291,6 +316,7 @@ async fn backend_loop(
     ));
     let mut tracker = ActivityTracker::new();
     let mut pending = PendingChats::default();
+    let mut failed_chats = HashSet::new();
     let mut current_chat: Option<String> = None;
     let mut chats_due = false;
     let mut push_connected = false;
@@ -380,6 +406,7 @@ async fn backend_loop(
                 }
             }
             _ = fallback.tick() => {
+                for id in failed_chats.drain() { pending.insert(id); }
                 for kind in auxiliary_retry.iter().copied() {
                     spawn_auxiliary(kind, &mut auxiliary_tasks, &mut auxiliary_running);
                 }
@@ -394,6 +421,11 @@ async fn backend_loop(
                         tracing::warn!("Background authentication unavailable: {}", error);
                         // Do not spin at the coalescing frequency after auth failure.
                         chats_due = false;
+                        // Keep channel invalidations through auth recovery, even
+                        // when that channel is absent from the recent-chat list.
+                        for id in pending.ids.drain() {
+                            if failed_chats.len() < MAX_PENDING { failed_chats.insert(id); }
+                        }
                         pending = PendingChats::default();
                         continue;
                     }
@@ -409,6 +441,7 @@ async fn backend_loop(
                 if let Some(chat_id) = pending.pop() {
                     let result = api::read_messages_data(&client, &chat_id, HISTORY_LIMIT).await;
                     healthy &= result.is_ok();
+                    if result.is_err() && failed_chats.len() < MAX_PENDING { failed_chats.insert(chat_id.clone()); }
                     deliver_messages(&resp_tx, &mut tracker, &chat_id, result, false, current_chat.as_deref() == Some(&chat_id));
                 }
                 if !healthy {
@@ -463,7 +496,9 @@ mod tests {
     fn opening_history_is_silent_and_reconnect_replays_are_deduplicated() {
         let mut tracker = ActivityTracker::new();
         let old = message("1000", "2026-01-01T00:00:00Z");
-        assert!(tracker.observe("chat", &[old.clone()], true).is_empty());
+        assert!(tracker
+            .observe("chat", std::slice::from_ref(&old), true)
+            .is_empty());
         let new = message("2000", "2026-01-01T00:00:01Z");
         let events = tracker.observe("chat", &[old.clone(), new.clone()], false);
         assert_eq!(events.len(), 1);
@@ -494,5 +529,72 @@ mod tests {
         assert!(tracker
             .observe("chat", &[message("opaque", "")], false)
             .is_empty());
+    }
+    #[test]
+    fn distinct_message_ids_with_identical_timestamp_are_not_dropped() {
+        let mut tracker = ActivityTracker::new();
+        let first = message("1000", "2026-01-01T00:00:00Z");
+        assert!(tracker
+            .observe("chat", std::slice::from_ref(&first), true)
+            .is_empty());
+        let second = message("1001", "2026-01-01T00:00:00Z");
+        assert_eq!(
+            tracker
+                .observe("chat", &[first, second.clone()], false)
+                .len(),
+            1
+        );
+        assert!(tracker.observe("chat", &[second], false).is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_owned_tasks() {
+        let (mut backend, _) = Backend::for_test();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        backend.task = Some(tokio::spawn(async move {
+            let _guard = OnDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
+        backend.shutdown().await;
+        dropped_rx.await.unwrap();
+    }
+    #[test]
+    fn stale_startup_chat_summary_does_not_emit_recent_history() {
+        let mut tracker = ActivityTracker::new();
+        tracker.started_at = timestamp_millis("2026-01-01T10:00:00Z").unwrap();
+        let chat = api::ChatInfo {
+            id: "chat".into(),
+            last_message_time: Some("2026-01-01T09:59:00Z".into()),
+            last_message_id: Some("1000".into()),
+            name: "Chat".into(),
+            is_group: false,
+            last_message_sender_id: None,
+            last_message_type: None,
+            unread_count: None,
+            has_unread: None,
+            last_message_sender: None,
+            last_message_preview: None,
+        };
+        tracker.reconcile_chats(&[chat], &mut PendingChats::default());
+        assert!(tracker
+            .observe("chat", &[message("1001", "2026-01-01T09:59:30Z")], false)
+            .is_empty());
+        assert_eq!(
+            tracker
+                .observe("chat", &[message("1002", "2026-01-01T10:00:01Z")], false)
+                .len(),
+            1
+        );
     }
 }

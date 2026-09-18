@@ -100,6 +100,25 @@ Mouse controls are enabled automatically:
 
 Keyboard navigation remains available. For terminal text selection, use your terminal's mouse-capture override (commonly Shift+drag). Mouse capture is released when OST exits.
 
+### Live updates
+
+The TUI subscribes to incoming chat activity automatically. It refreshes the open
+conversation and recent-chat list without input, and checks for missed updates
+every 30 seconds. Each reconciliation reads up to 50 recent conversations and 50
+messages per affected conversation; very large backlogs may need opening in Teams.
+Draft text, the selected conversation, search, and your reading position survive
+background refreshes. The view follows new messages when already at the latest
+message; scrolling back keeps your place.
+
+The header reports **Live** only after push registration succeeds. **Reconnecting**
+shows the retry delay while periodic checks continue; **Degraded** reports a push,
+authentication, or message-refresh problem. Teams presence appears separately in
+parentheses. Reconnection renews expired credentials automatically when a refresh
+token is available; otherwise use `teams-cli login` in another terminal. The TUI
+subscribes only to messaging and never answers calls.
+
+### Desktop notifications
+
 Desktop alerts use `notify-send` and your Linux desktop notification daemon. New messages in other conversations, messages received while the terminal is unfocused, and explicit mentions of your account can trigger alerts containing the sender, conversation name, and a short message preview. Ordinary messages in the focused conversation are quiet. Focus detection depends on terminal support; typing or clicking also establishes focus. Before the first focus event or interaction, OST treats the terminal as unfocused.
 
 Your own messages, history loads, repeated deliveries, and messages more than two minutes old do not trigger alerts. Mentions use account IDs from Teams metadata; writing your display name in plain text is not a mention. Alerts wait until your account identity is available. A missing helper or notification daemon is nonfatal and logged in the debug pane. Delivery runs asynchronously with a bounded queue and timeout; excess or delayed alerts may be dropped during a burst or desktop-service stall.
