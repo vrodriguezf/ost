@@ -100,6 +100,23 @@ Mouse controls are enabled automatically:
 
 Keyboard navigation remains available. For terminal text selection, use your terminal's mouse-capture override (commonly Shift+drag). Mouse capture is released when OST exits.
 
+### Live updates
+
+The TUI subscribes to incoming chat activity automatically. It refreshes the open
+conversation and recent-chat list without input, and checks for missed updates
+every 30 seconds. Each reconciliation reads up to 50 recent conversations and 50
+messages per affected conversation; very large backlogs may need opening in Teams.
+Draft text, the selected conversation, search, and your reading position survive
+background refreshes. The view follows new messages when already at the latest
+message; scrolling back keeps your place.
+
+The header reports **Live** only after push registration succeeds. **Reconnecting**
+shows the retry delay while periodic checks continue; **Degraded** reports a push,
+authentication, or message-refresh problem. Teams presence appears separately in
+parentheses. Reconnection renews expired credentials automatically when a refresh
+token is available; otherwise use `teams-cli login` in another terminal. The TUI
+subscribes only to messaging and never answers calls.
+
 ### Authentication
 
 Login with device code flow:

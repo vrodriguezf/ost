@@ -575,3 +575,129 @@ fn terminal_session_fixture() {
         result.unwrap();
     }
 }
+
+fn live_message(id: u64, content: &str) -> api::MessageInfo {
+    api::MessageInfo {
+        id: id.to_string(),
+        sender_id: "8:orgid:other".into(),
+        sender: "Sender".into(),
+        timestamp: "2026-09-18T10:00:00Z".into(),
+        content: content.into(),
+        mentions: vec![],
+    }
+}
+
+#[test]
+fn background_history_keeps_draft_search_and_message_identity() {
+    let mut h = Harness::new();
+    h.app.current_chat_id = Some("chat".into());
+    h.app.messages.update_messages(
+        "Chat",
+        vec![
+            live_message(1, "first match"),
+            live_message(2, "second match"),
+        ],
+    );
+    h.app.messages.selected = 0;
+    h.app.compose.input = "unfinished draft".into();
+    h.app.search.activate();
+    h.app.search.query = "match".into();
+    h.app.search.cursor_pos = 3;
+    h.app.search.update_results(&h.app.sidebar, &h.app.messages);
+    h.app.search.selected = 1;
+    let apply = |h: &mut Harness, messages| {
+        h.app.handle_backend_response(
+            BackendResponse::Messages {
+                chat_id: "chat".into(),
+                result: Ok(messages),
+            },
+            &h.backend,
+        );
+    };
+    apply(
+        &mut h,
+        vec![
+            live_message(2, "second match"),
+            live_message(3, "new match"),
+        ],
+    );
+    assert_eq!(h.app.messages.messages.len(), 3);
+    assert_eq!(h.app.messages.messages[h.app.messages.selected].id, "1");
+    assert_eq!(h.app.compose.input, "unfinished draft");
+    assert!(h.app.search.active);
+    assert_eq!(h.app.search.query, "match");
+    assert_eq!(h.app.search.cursor_pos, 3);
+    let SearchResultKind::Message(index) = h.app.search.selected_result().unwrap().kind else {
+        panic!("message result")
+    };
+    assert_eq!(h.app.messages.messages[index].id, "2");
+    // A stale snapshot cannot erase or duplicate the newer message.
+    apply(
+        &mut h,
+        vec![
+            live_message(1, "first match"),
+            live_message(2, "second match"),
+        ],
+    );
+    assert_eq!(h.app.messages.messages.len(), 3);
+    assert_eq!(h.app.messages.messages.last().unwrap().id, "3");
+}
+
+#[test]
+fn background_history_preserves_wheel_anchor_and_follows_latest_when_selected() {
+    let mut h = Harness::new();
+    let messages = (1..30)
+        .map(|i| live_message(i, &format!("Message {i}")))
+        .collect();
+    h.app.messages.update_messages("Chat", messages);
+    h.draw();
+    h.app.messages.viewport.scroll(true);
+    h.draw();
+    let offset = h.app.messages.viewport.offset;
+    let selected = h.app.messages.messages[h.app.messages.selected].id.clone();
+    h.app
+        .messages
+        .update_messages("Chat", vec![live_message(30, "new message")]);
+    h.draw();
+    assert_eq!(h.app.messages.viewport.offset, offset);
+    assert_eq!(
+        h.app.messages.messages[h.app.messages.selected].id,
+        selected
+    );
+    // Older backfilled messages preserve the first visible text via its ID anchor.
+    let first_visible = row_text(h.terminal.backend().buffer(), 3);
+    h.app
+        .messages
+        .update_messages("Chat", vec![live_message(0, "old backfill")]);
+    h.draw();
+    assert_eq!(row_text(h.terminal.backend().buffer(), 3), first_visible);
+    h.app.messages.selected = h.app.messages.messages.len() - 1;
+    h.app.messages.viewport.follow_selection = true;
+    h.app
+        .messages
+        .update_messages("Chat", vec![live_message(31, "latest message")]);
+    h.draw();
+    assert_eq!(h.app.messages.messages[h.app.messages.selected].id, "31");
+    h.text_position("latest message");
+}
+
+#[test]
+fn presence_never_claims_that_the_push_connection_is_healthy() {
+    let mut h = Harness::new();
+    h.app.handle_backend_response(
+        BackendResponse::ConnectionState(ConnectionState::Reconnecting { retry_in_secs: 8 }),
+        &h.backend,
+    );
+    h.app.handle_backend_response(
+        BackendResponse::Presence(Err(anyhow::anyhow!("offline"))),
+        &h.backend,
+    );
+    assert!(!h.app.is_online);
+    assert!(h.app.connection_state.contains("Reconnecting"));
+    h.app.handle_backend_response(
+        BackendResponse::ConnectionState(ConnectionState::Connected),
+        &h.backend,
+    );
+    assert!(h.app.is_online);
+    assert_eq!(h.app.connection_state, "Live");
+}
