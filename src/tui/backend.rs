@@ -23,6 +23,8 @@ pub enum BackendCommand {
 
 /// Responses from the async backend to the TUI.
 pub enum BackendResponse {
+    IncomingMessage(super::activity::IncomingMessage),
+    ConnectionState(super::activity::ConnectionState),
     Teams(Result<Vec<api::TeamInfo>>),
     Chats(Result<Vec<api::ChatInfo>>),
     Messages {

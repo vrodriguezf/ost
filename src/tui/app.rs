@@ -565,6 +565,7 @@ impl App {
     fn handle_backend_response(&mut self, response: BackendResponse, backend: &Backend) {
         self.mouse.clear();
         match response {
+            BackendResponse::IncomingMessage(_) | BackendResponse::ConnectionState(_) => {}
             BackendResponse::Teams(Ok(teams)) => {
                 self.sidebar.update_teams(teams);
                 self.sidebar.loading = false;

@@ -198,10 +198,14 @@ pub struct ChatInfo {
 }
 
 /// A single message for TUI display.
+#[derive(Clone, Debug)]
 pub struct MessageInfo {
+    pub id: String,
+    pub sender_id: String,
     pub sender: String,
     pub timestamp: String,
     pub content: String,
+    pub mentions: Vec<String>,
 }
 
 /// List recent chats and return structured data.
@@ -343,9 +347,12 @@ pub async fn read_messages_data(
         }
 
         result.push(MessageInfo {
+            id: msg.id.clone().unwrap_or_default(),
+            sender_id: msg.from.clone().unwrap_or_default(),
             sender,
             timestamp: time,
             content: text.trim().to_string(),
+            mentions: Vec::new(),
         });
     }
 
