@@ -45,6 +45,7 @@ struct NativeMessage {
     content: Option<String>,
     messagetype: Option<String>,
     from: Option<String>,
+    properties: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -352,9 +353,72 @@ pub async fn read_messages_data(
             sender,
             timestamp: time,
             content: text.trim().to_string(),
-            mentions: Vec::new(),
+            mentions: explicit_mentions(msg.properties.as_ref()),
         });
     }
 
+    // Never rely on page order or repeat duplicate service IDs in the view.
+    result.sort_by(|left, right| {
+        message_sort_key(&left.timestamp, &left.id)
+            .cmp(&message_sort_key(&right.timestamp, &right.id))
+    });
+    let mut seen = std::collections::HashSet::new();
+    result.retain(|message| message.id.is_empty() || seen.insert(message.id.clone()));
     Ok(result)
+}
+
+/// Chronological key with a numeric ID tie-breaker (service IDs are milliseconds).
+pub(crate) fn message_sort_key(timestamp: &str, id: &str) -> (i64, u64, String) {
+    let time = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|time| time.timestamp_millis())
+        .or_else(|| id.parse().ok())
+        .unwrap_or(0);
+    (time, id.parse().unwrap_or(0), id.to_string())
+}
+
+/// Native Teams encodes properties.mentions as either an array or a JSON string.
+/// Numeric itemid/<at id> values are local indices, never user identities.
+fn explicit_mentions(properties: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(value) = properties.and_then(|value| value.get("mentions")) else {
+        return Vec::new();
+    };
+    let decoded;
+    let value = if let Some(text) = value.as_str() {
+        decoded = serde_json::from_str::<serde_json::Value>(text).unwrap_or_default();
+        &decoded
+    } else {
+        value
+    };
+    let mut mentions: Vec<_> = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|mention| mention.get("mri").and_then(serde_json::Value::as_str))
+        .filter(|mri| !mri.is_empty())
+        .map(String::from)
+        .collect();
+    mentions.sort();
+    mentions.dedup();
+    mentions
+}
+
+#[cfg(test)]
+mod live_message_tests {
+    use super::*;
+    #[test]
+    fn native_mentions_use_identity_not_index() {
+        let props = serde_json::json!({"mentions": "[{\"mri\":\"8:orgid:other\",\"itemid\":\"0\"},{\"itemid\":\"1\"}]"});
+        assert_eq!(explicit_mentions(Some(&props)), vec!["8:orgid:other"]);
+        let props = serde_json::json!({"mentions":[{"mri":"8:orgid:other"}]});
+        assert_eq!(explicit_mentions(Some(&props)), vec!["8:orgid:other"]);
+        assert!(explicit_mentions(None).is_empty());
+    }
+    #[test]
+    fn numeric_message_ids_break_timestamp_ties() {
+        assert!(
+            message_sort_key("2026-01-01T00:00:00Z", "9")
+                < message_sort_key("2026-01-01T00:00:00Z", "10")
+        );
+    }
 }

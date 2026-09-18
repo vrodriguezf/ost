@@ -137,7 +137,6 @@ pub async fn negotiate(
         .context("Failed to parse trouter session response")?;
 
     tracing::info!("Trouter session negotiated: socketio={}", session.socketio);
-    tracing::debug!("Trouter surl={}", session.surl);
 
     Ok((session, epid))
 }
@@ -152,7 +151,6 @@ pub async fn get_session_id(
     let url = session.session_url(epid);
 
     tracing::info!("Getting socket.io session ID...");
-    tracing::debug!("Session URL: {}", url);
 
     // Squads uses a no-redirect client for this request
     let no_redirect = reqwest::Client::builder()
@@ -173,7 +171,6 @@ pub async fn get_session_id(
     if !status.is_success() {
         anyhow::bail!("Socket.io session request failed: {} — {}", status, text);
     }
-    tracing::debug!("Session response: {}", text);
 
     // Format: "{session_id}:180:180:websocket,xhr-polling"
     let session_id = text

@@ -10,6 +10,7 @@ mod teams;
 use anyhow::Result;
 
 // Re-export data types for TUI integration
+pub(crate) use chat::message_sort_key;
 pub use chat::{ChatInfo, MessageInfo};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;

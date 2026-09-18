@@ -134,6 +134,8 @@ fn row_text(buffer: &Buffer, y: u16) -> String {
 
 fn message(content: &str) -> Message {
     Message {
+        id: content.into(),
+        sender_id: "other".into(),
         sender: "Sender".into(),
         timestamp: "12:34".into(),
         content: content.into(),

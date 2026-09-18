@@ -1,17 +1,20 @@
-//! Async backend: bridges the sync TUI event loop with async API calls.
-//!
-//! Uses an mpsc channel pair. The TUI sends `BackendCommand` values, and a
-//! background tokio task executes them and sends `BackendResponse` values back.
+//! Async backend with a quiet push subscription and bounded reconciliation.
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::Duration,
+};
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    task::{JoinHandle, JoinSet},
+    time,
+};
 
-use crate::api;
-use crate::api::client::TeamsClient;
+use super::activity::{ConnectionState, IncomingMessage};
+use crate::{api, api::client::TeamsClient, trouter::subscription};
 
-/// Commands sent from the TUI event loop to the async backend.
 pub enum BackendCommand {
     LoadTeams,
     LoadChats { limit: usize },
@@ -21,10 +24,9 @@ pub enum BackendCommand {
     LoadPresence,
 }
 
-/// Responses from the async backend to the TUI.
 pub enum BackendResponse {
-    IncomingMessage(super::activity::IncomingMessage),
-    ConnectionState(super::activity::ConnectionState),
+    IncomingMessage(IncomingMessage),
+    ConnectionState(ConnectionState),
     Teams(Result<Vec<api::TeamInfo>>),
     Chats(Result<Vec<api::ChatInfo>>),
     Messages {
@@ -34,103 +36,463 @@ pub enum BackendResponse {
     MessageSent(Result<()>),
     UserInfo(Result<api::UserInfo>),
     Presence(Result<api::PresenceInfo>),
-    /// Initial client creation failed (auth issue).
     ClientError(String),
 }
 
-/// Handle for interacting with the backend from the TUI side.
 pub struct Backend {
     cmd_tx: mpsc::UnboundedSender<BackendCommand>,
     resp_rx: mpsc::UnboundedReceiver<BackendResponse>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            // Cancels pending network work; backend's JoinSet cancels push too.
+            task.abort();
+        }
+    }
 }
 
 impl Backend {
-    /// An inert command sink for UI interaction tests; never starts an API client.
     #[cfg(test)]
     pub fn for_test() -> (Self, mpsc::UnboundedReceiver<BackendCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (_, resp_rx) = mpsc::unbounded_channel();
-        (Self { cmd_tx, resp_rx }, cmd_rx)
+        (
+            Self {
+                cmd_tx,
+                resp_rx,
+                task: None,
+            },
+            cmd_rx,
+        )
     }
 
-    /// Start the backend. Spawns a tokio task that processes commands.
-    ///
-    /// Returns the Backend handle for sending commands and receiving responses.
     pub fn start() -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (resp_tx, resp_rx) = mpsc::unbounded_channel();
-
-        tokio::spawn(backend_loop(cmd_rx, resp_tx));
-
-        Self { cmd_tx, resp_rx }
+        let task = tokio::spawn(backend_loop(cmd_rx, resp_tx));
+        Self {
+            cmd_tx,
+            resp_rx,
+            task: Some(task),
+        }
     }
 
-    /// Send a command to the backend (non-blocking).
     pub fn send(&self, cmd: BackendCommand) {
         if self.cmd_tx.send(cmd).is_err() {
             tracing::error!("Backend channel closed -- command dropped");
         }
     }
 
-    /// Receive a response from the backend.
-    ///
-    /// Suspends until a response is available. Returns `None` only when the
-    /// backend channel is permanently closed (all senders dropped).
-    /// Designed to be used inside `tokio::select!`.
     pub async fn recv(&mut self) -> Option<BackendResponse> {
         self.resp_rx.recv().await
     }
+
+    pub async fn shutdown(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
-/// Background loop that processes commands.
-///
-/// Creates a TeamsClient once and reuses it across all API calls.
-/// If client creation fails, sends a ClientError response and exits.
+const HISTORY_LIMIT: usize = 50;
+const CHAT_LIMIT: usize = 50;
+const MAX_PENDING: usize = 64;
+const MAX_SEEN: usize = 1024;
+
+#[derive(Default)]
+struct PendingChats {
+    order: VecDeque<String>,
+    ids: HashSet<String>,
+}
+
+impl PendingChats {
+    fn insert(&mut self, id: String) {
+        if self.ids.len() < MAX_PENDING && self.ids.insert(id.clone()) {
+            self.order.push_back(id);
+        }
+    }
+    fn pop(&mut self) -> Option<String> {
+        let id = self.order.pop_front()?;
+        self.ids.remove(&id);
+        Some(id)
+    }
+}
+
+#[derive(Default)]
+struct Cursor {
+    watermark: i64,
+    seen: VecDeque<String>,
+}
+
+struct ActivityTracker {
+    started_at: i64,
+    initialized: bool,
+    summaries: HashMap<String, String>,
+    cursors: HashMap<String, Cursor>,
+}
+
+impl ActivityTracker {
+    fn new() -> Self {
+        Self {
+            started_at: chrono::Utc::now().timestamp_millis(),
+            initialized: false,
+            summaries: HashMap::new(),
+            cursors: HashMap::new(),
+        }
+    }
+
+    fn reconcile_chats(&mut self, chats: &[api::ChatInfo], pending: &mut PendingChats) {
+        for chat in chats {
+            let signature = format!(
+                "{:?}|{:?}|{:?}",
+                chat.last_message_time, chat.last_message_sender, chat.last_message_preview
+            );
+            let previous = self.summaries.insert(chat.id.clone(), signature.clone());
+            if !self.initialized {
+                self.cursors
+                    .entry(chat.id.clone())
+                    .or_insert_with(|| Cursor {
+                        watermark: chat
+                            .last_message_time
+                            .as_deref()
+                            .and_then(timestamp_millis)
+                            .unwrap_or(self.started_at),
+                        ..Cursor::default()
+                    });
+            } else if previous.as_deref() != Some(&signature) {
+                pending.insert(chat.id.clone());
+            }
+        }
+        self.initialized = true;
+    }
+
+    fn observe(
+        &mut self,
+        chat_id: &str,
+        messages: &[api::MessageInfo],
+        opening: bool,
+    ) -> Vec<IncomingMessage> {
+        // Opening an untracked old channel establishes its history baseline.
+        let baseline = if opening && !self.cursors.contains_key(chat_id) {
+            messages
+                .iter()
+                .filter_map(message_time)
+                .max()
+                .unwrap_or(self.started_at)
+        } else {
+            self.started_at
+        };
+        let cursor = self
+            .cursors
+            .entry(chat_id.to_string())
+            .or_insert_with(|| Cursor {
+                watermark: baseline,
+                ..Cursor::default()
+            });
+        let previous_watermark = cursor.watermark;
+        let mut incoming = Vec::new();
+        for message in messages {
+            let time = message_time(message).unwrap_or(previous_watermark);
+            if !message.id.is_empty() && !cursor.seen.contains(&message.id) {
+                if time > previous_watermark {
+                    incoming.push(IncomingMessage {
+                        chat_id: chat_id.to_string(),
+                        id: message.id.clone(),
+                        sender_id: message.sender_id.clone(),
+                        sender: message.sender.clone(),
+                        timestamp: message.timestamp.clone(),
+                        content: message.content.clone(),
+                        mentions: message.mentions.clone(),
+                    });
+                }
+                cursor.seen.push_back(message.id.clone());
+                if cursor.seen.len() > MAX_SEEN {
+                    cursor.seen.pop_front();
+                }
+            }
+            cursor.watermark = cursor.watermark.max(time);
+        }
+        incoming
+    }
+}
+
+fn timestamp_millis(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.timestamp_millis())
+        .or_else(|| value.parse::<i64>().ok())
+}
+
+fn message_time(message: &api::MessageInfo) -> Option<i64> {
+    timestamp_millis(&message.timestamp).or_else(|| message.id.parse().ok())
+}
+
+async fn client() -> Result<TeamsClient> {
+    time::timeout(Duration::from_secs(60), TeamsClient::new())
+        .await
+        .map_err(|_| anyhow::anyhow!("Authentication refresh timed out; retrying automatically"))?
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Auxiliary {
+    Teams,
+    User,
+    Presence,
+}
+
+type AuxiliaryResult = (Auxiliary, bool, BackendResponse);
+
+fn spawn_auxiliary(
+    kind: Auxiliary,
+    tasks: &mut JoinSet<AuxiliaryResult>,
+    running: &mut HashSet<Auxiliary>,
+) {
+    if !running.insert(kind) {
+        return;
+    }
+    tasks.spawn(async move {
+        macro_rules! fetch {
+            ($api:path, $variant:ident) => {{
+                let result = time::timeout(Duration::from_secs(60), async {
+                    let client = client().await?;
+                    $api(&client).await
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!("Request timed out; retrying automatically"))
+                });
+                (kind, result.is_ok(), BackendResponse::$variant(result))
+            }};
+        }
+        match kind {
+            Auxiliary::Teams => fetch!(api::list_teams_data, Teams),
+            Auxiliary::User => fetch!(api::whoami_data, UserInfo),
+            Auxiliary::Presence => fetch!(api::get_presence_data, Presence),
+        }
+    });
+}
+
 async fn backend_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<BackendCommand>,
     resp_tx: mpsc::UnboundedSender<BackendResponse>,
 ) {
-    // Try to create the client. If this fails, the user needs to login first.
-    let client = match TeamsClient::new().await {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            let _ = resp_tx.send(BackendResponse::ClientError(format!("{:#}", e)));
-            return;
-        }
-    };
+    let (push_tx, mut push_rx) = mpsc::channel(64);
+    let mut tasks = JoinSet::new();
+    tasks.spawn(subscription::run(push_tx));
+    let mut auxiliary_tasks = JoinSet::new();
+    let mut auxiliary_running = HashSet::new();
+    let mut auxiliary_retry = HashSet::new();
+    let _ = resp_tx.send(BackendResponse::ConnectionState(
+        ConnectionState::Connecting,
+    ));
+    let mut tracker = ActivityTracker::new();
+    let mut pending = PendingChats::default();
+    let mut current_chat: Option<String> = None;
+    let mut chats_due = false;
+    let mut push_connected = false;
+    let mut fallback = time::interval(Duration::from_secs(30));
+    fallback.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    fallback.tick().await;
+    let mut reconcile = time::interval(Duration::from_millis(750));
+    reconcile.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
-    while let Some(cmd) = cmd_rx.recv().await {
-        let client = Arc::clone(&client);
-        let resp_tx = resp_tx.clone();
-
-        // Spawn each command as a separate task so we don't block the loop.
-        tokio::spawn(async move {
-            match cmd {
-                BackendCommand::LoadTeams => {
-                    let result = api::list_teams_data(&client).await;
-                    let _ = resp_tx.send(BackendResponse::Teams(result));
+    // Requests are serialized deliberately: responses cannot race and replace a
+    // newer history with an older snapshot. The terminal loop remains async.
+    loop {
+        tokio::select! {
+            biased;
+            _ = resp_tx.closed() => break,
+            command = cmd_rx.recv() => {
+                let Some(command) = command else { break };
+                let auxiliary = match &command {
+                    BackendCommand::LoadTeams => Some(Auxiliary::Teams),
+                    BackendCommand::LoadUserInfo => Some(Auxiliary::User),
+                    BackendCommand::LoadPresence => Some(Auxiliary::Presence),
+                    _ => None,
+                };
+                if let Some(kind) = auxiliary {
+                    spawn_auxiliary(kind, &mut auxiliary_tasks, &mut auxiliary_running);
+                    continue;
                 }
-                BackendCommand::LoadChats { limit } => {
-                    let result = api::list_chats_data(&client, limit).await;
-                    let _ = resp_tx.send(BackendResponse::Chats(result));
+                if let BackendCommand::LoadMessages { chat_id, .. } = &command {
+                    current_chat = Some(chat_id.clone());
                 }
-                BackendCommand::LoadMessages { chat_id, limit } => {
-                    let result = api::read_messages_data(&client, &chat_id, limit).await;
-                    let _ = resp_tx.send(BackendResponse::Messages { chat_id, result });
-                }
-                BackendCommand::SendMessage { chat_id, message } => {
-                    let result = api::send_message_with_client(&client, &chat_id, &message).await;
-                    let _ = resp_tx.send(BackendResponse::MessageSent(result));
-                }
-                BackendCommand::LoadUserInfo => {
-                    let result = api::whoami_data(&client).await;
-                    let _ = resp_tx.send(BackendResponse::UserInfo(result));
-                }
-                BackendCommand::LoadPresence => {
-                    let result = api::get_presence_data(&client).await;
-                    let _ = resp_tx.send(BackendResponse::Presence(result));
+                let client = match client().await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        let _ = resp_tx.send(BackendResponse::ClientError(error.to_string()));
+                        chats_due = true;
+                        continue;
+                    }
+                };
+                match command {
+                    BackendCommand::LoadTeams => { let _ = resp_tx.send(BackendResponse::Teams(api::list_teams_data(&client).await)); }
+                    BackendCommand::LoadChats { limit } => {
+                        let result = api::list_chats_data(&client, limit.min(CHAT_LIMIT)).await;
+                        if let Ok(chats) = &result { tracker.reconcile_chats(chats, &mut pending); }
+                        let _ = resp_tx.send(BackendResponse::Chats(result));
+                    }
+                    BackendCommand::LoadMessages { chat_id, limit } => {
+                        current_chat = Some(chat_id.clone());
+                        let result = api::read_messages_data(&client, &chat_id, limit.min(HISTORY_LIMIT)).await;
+                        deliver_messages(&resp_tx, &mut tracker, &chat_id, result, true, true);
+                    }
+                    BackendCommand::SendMessage { chat_id, message } => {
+                        let result = api::send_message_with_client(&client, &chat_id, &message).await;
+                        let _ = resp_tx.send(BackendResponse::MessageSent(result));
+                        chats_due = true;
+                    }
+                    BackendCommand::LoadUserInfo => { let _ = resp_tx.send(BackendResponse::UserInfo(api::whoami_data(&client).await)); }
+                    BackendCommand::LoadPresence => { let _ = resp_tx.send(BackendResponse::Presence(api::get_presence_data(&client).await)); }
                 }
             }
+            Some(result) = auxiliary_tasks.join_next(), if !auxiliary_tasks.is_empty() => {
+                if let Ok((kind, success, response)) = result {
+                    auxiliary_running.remove(&kind);
+                    if success { auxiliary_retry.remove(&kind); } else { auxiliary_retry.insert(kind); }
+                    let _ = resp_tx.send(response);
+                }
+            }
+            Some(event) = push_rx.recv() => {
+                match event {
+                    subscription::Event::Connected => {
+                        push_connected = true;
+                        chats_due = true;
+                        if let Some(id) = &current_chat { pending.insert(id.clone()); }
+                        let _ = resp_tx.send(BackendResponse::ConnectionState(ConnectionState::Connected));
+                    }
+                    subscription::Event::Degraded => {
+                        push_connected = false;
+                        let _ = resp_tx.send(BackendResponse::ConnectionState(ConnectionState::Degraded("Push unavailable; checking every 30s".into())));
+                    }
+                    subscription::Event::Reconnecting { retry_in_secs } => {
+                        let _ = resp_tx.send(BackendResponse::ConnectionState(ConnectionState::Reconnecting { retry_in_secs }));
+                    }
+                    subscription::Event::Refresh(ids) => {
+                        chats_due = true;
+                        for id in ids { pending.insert(id); }
+                        if let Some(id) = &current_chat { pending.insert(id.clone()); }
+                    }
+                }
+            }
+            _ = fallback.tick() => {
+                for kind in auxiliary_retry.iter().copied() {
+                    spawn_auxiliary(kind, &mut auxiliary_tasks, &mut auxiliary_running);
+                }
+                chats_due = true;
+                if let Some(id) = &current_chat { pending.insert(id.clone()); }
+            }
+            _ = reconcile.tick(), if chats_due || !pending.ids.is_empty() => {
+                let client = match client().await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        let _ = resp_tx.send(BackendResponse::ConnectionState(ConnectionState::Degraded("Authentication unavailable; retrying".into())));
+                        tracing::warn!("Background authentication unavailable: {}", error);
+                        // Do not spin at the coalescing frequency after auth failure.
+                        chats_due = false;
+                        pending = PendingChats::default();
+                        continue;
+                    }
+                };
+                let mut healthy = true;
+                if chats_due {
+                    chats_due = false;
+                    let result = api::list_chats_data(&client, CHAT_LIMIT).await;
+                    if let Ok(chats) = &result { tracker.reconcile_chats(chats, &mut pending); } else { healthy = false; }
+                    let _ = resp_tx.send(BackendResponse::Chats(result));
+                }
+                // One conversation per tick bounds traffic even during a burst.
+                if let Some(chat_id) = pending.pop() {
+                    let result = api::read_messages_data(&client, &chat_id, HISTORY_LIMIT).await;
+                    healthy &= result.is_ok();
+                    deliver_messages(&resp_tx, &mut tracker, &chat_id, result, false, current_chat.as_deref() == Some(&chat_id));
+                }
+                if !healthy {
+                    let _ = resp_tx.send(BackendResponse::ConnectionState(ConnectionState::Degraded("Message refresh failed; retrying".into())));
+                } else if push_connected {
+                    let _ = resp_tx.send(BackendResponse::ConnectionState(ConnectionState::Connected));
+                }
+            }
+        }
+    }
+    tasks.abort_all();
+    auxiliary_tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    while auxiliary_tasks.join_next().await.is_some() {}
+}
+
+fn deliver_messages(
+    tx: &mpsc::UnboundedSender<BackendResponse>,
+    tracker: &mut ActivityTracker,
+    chat_id: &str,
+    result: Result<Vec<api::MessageInfo>>,
+    opening: bool,
+    visible: bool,
+) {
+    if let Ok(messages) = &result {
+        for event in tracker.observe(chat_id, messages, opening) {
+            let _ = tx.send(BackendResponse::IncomingMessage(event));
+        }
+    }
+    if visible {
+        let _ = tx.send(BackendResponse::Messages {
+            chat_id: chat_id.to_string(),
+            result,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn message(id: &str, timestamp: &str) -> api::MessageInfo {
+        api::MessageInfo {
+            id: id.into(),
+            sender_id: "8:orgid:other".into(),
+            sender: "Other".into(),
+            timestamp: timestamp.into(),
+            content: "Hello".into(),
+            mentions: vec![],
+        }
+    }
+    #[test]
+    fn opening_history_is_silent_and_reconnect_replays_are_deduplicated() {
+        let mut tracker = ActivityTracker::new();
+        let old = message("1000", "2026-01-01T00:00:00Z");
+        assert!(tracker.observe("chat", &[old.clone()], true).is_empty());
+        let new = message("2000", "2026-01-01T00:00:01Z");
+        let events = tracker.observe("chat", &[old.clone(), new.clone()], false);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "2000");
+        assert!(tracker.observe("chat", &[old, new], false).is_empty());
+        assert!(tracker
+            .observe("chat", &[message("500", "2025-01-01T00:00:00Z")], false)
+            .is_empty());
+    }
+    #[test]
+    fn invalidations_are_bounded_coalesced_and_fifo() {
+        let mut pending = PendingChats::default();
+        pending.insert("first".into());
+        pending.insert("first".into());
+        for i in 0..100 {
+            pending.insert(i.to_string());
+        }
+        assert_eq!(pending.ids.len(), MAX_PENDING);
+        assert_eq!(pending.pop(), Some("first".into()));
+        assert_eq!(pending.pop(), Some("0".into()));
+    }
+    #[test]
+    fn missing_identity_and_timestamp_do_not_replay_history() {
+        let mut tracker = ActivityTracker::new();
+        assert!(tracker
+            .observe("chat", &[message("", "")], false)
+            .is_empty());
+        assert!(tracker
+            .observe("chat", &[message("opaque", "")], false)
+            .is_empty());
     }
 }
