@@ -65,7 +65,35 @@ fn setup() -> (App, Backend, Receiver<QueuedNotification>) {
 
 fn draw(app: &mut App, terminal: &mut Terminal<TestBackend>) {
     terminal.draw(|frame| app.render(frame)).unwrap();
-    app.acknowledge_rendered();
+    if app.acknowledge_rendered() {
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+}
+
+#[test]
+fn delayed_identity_replays_incoming_activity_once_and_suppresses_own_messages() {
+    let (mut app, backend, mut alerts) = setup();
+    app.current_user_id = None;
+    let incoming = message("background", "deferred-1");
+    let mut own = message("background", "deferred-own");
+    own.sender_id = "8:orgid:me".into();
+    for event in [incoming.clone(), incoming, own] {
+        app.handle_backend_response(BackendResponse::IncomingMessage(event), &backend);
+    }
+    assert!(alerts.try_recv().is_err());
+    assert!(!app.unread.badge("background").any());
+    app.handle_backend_response(
+        BackendResponse::UserInfo(Ok(crate::api::UserInfo {
+            display_name: "Me".into(),
+            id: "me".into(),
+            mail: None,
+        })),
+        &backend,
+    );
+    assert_eq!(app.unread.badge("background").count, 1);
+    assert!(alerts.try_recv().is_ok());
+    assert!(alerts.try_recv().is_err());
+    assert!(app.deferred_incoming.is_empty());
 }
 
 #[test]

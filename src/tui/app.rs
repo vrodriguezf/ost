@@ -121,8 +121,6 @@ impl App {
             mouse: HitMap::default(),
             notification_policy: NotificationPolicy::from_env(),
             notification_service: None,
-            terminal_focused: false,
-            current_user_id: None,
             unread: UnreadState::default(),
             loaded_last_stamp: None,
             rendered_chat_id: None,
@@ -176,8 +174,6 @@ impl App {
             if key_event.kind != KeyEventKind::Press {
                 return;
             }
-            self.terminal_focused = true;
-
             // Direct input confirms focus on terminals without focus reports.
             self.terminal_focused = true;
             // When help popup is visible, any key closes it.
@@ -607,8 +603,8 @@ impl App {
         let selected_search = self.search.selected;
         let search_offset = self.search.viewport.offset;
         match response {
-            // Activity consumers (unread and notifications) attach here. The
-            // selected history follows as an authoritative Messages response.
+            // Both consumers see the activity before the authoritative history
+            // response can acknowledge it as displayed.
             BackendResponse::IncomingMessage(message) => self.dispatch_incoming(&message),
             BackendResponse::ConnectionState(state) => {
                 self.is_online = state == ConnectionState::Connected;
@@ -689,7 +685,6 @@ impl App {
                 self.set_error(format!("Failed to send message: {:#}", e));
             }
             BackendResponse::UserInfo(Ok(info)) => {
-                self.current_user_id = Some(info.id);
                 self.user_name = info.display_name;
                 if self.current_user_id.is_none() {
                     self.load_unread_account("", &info.id);
@@ -767,7 +762,7 @@ impl App {
         }
         self.current_user_id = Some(user.to_owned());
         for message in std::mem::take(&mut self.deferred_incoming) {
-            self.unread.incoming(&message, Some(user));
+            self.dispatch_incoming(&message);
         }
         self.sidebar.apply_unread(&self.unread);
     }

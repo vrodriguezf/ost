@@ -60,7 +60,7 @@ def check_session(executable, mode):
         while select.select([master], [], [], 0.05)[0]:
             output.extend(os.read(master, 65536))
         assert process.returncode == (101 if mode == "panic" else 0), output.decode(errors="replace")
-        for code in (1000, 1002, 1003, 1015, 1006):
+        for code in (1000, 1002, 1003, 1015, 1006, 1004):
             enable, disable = f"\x1b[?{code}h".encode(), f"\x1b[?{code}l".encode()
             assert enable in output and disable in output, (mode, code)
             assert output.rfind(disable) > output.find(enable), (mode, code)
