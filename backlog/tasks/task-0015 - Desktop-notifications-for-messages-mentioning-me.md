@@ -1,11 +1,11 @@
 ---
 id: TASK-0015
 title: Desktop notifications for messages mentioning me
-status: In Progress
+status: Done
 assignee:
   - '@codex-notifications'
 created_date: '2026-02-06 00:13'
-updated_date: '2026-09-18 12:02'
+updated_date: '2026-09-18 12:16'
 labels:
   - tui
   - feature
@@ -26,12 +26,12 @@ Should detect mentions in incoming messages from the trouter/websocket event str
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A desktop notification appears when a new message mentions the current user
+- [x] #1 A desktop notification appears when a new message mentions the current user
 - [x] #2 Notification shows sender name, channel/chat name, and message snippet
 - [x] #3 Notifications only fire for messages from others, not the user's own messages
 - [x] #4 Works with notify-send or equivalent Linux notification mechanism
 - [x] #5 New incoming messages in background conversations, and in the selected conversation when terminal focus is lost, can show desktop alerts; foreground non-mentions are suppressed.
-- [ ] #6 Historical loads, repeated push deliveries, and fallback refreshes do not replay desktop notifications.
+- [x] #6 Historical loads, repeated push deliveries, and fallback refreshes do not replay desktop notifications.
 - [x] #7 Notification execution is asynchronous, safely passes sender and message text as literal arguments, supports an opt-out, and tolerates an unavailable notification daemon.
 <!-- AC:END -->
 
@@ -54,14 +54,16 @@ Implementing a bounded asynchronous notify-send worker and identity-based policy
 Implemented notification policy, bounded nonblocking queue (16), notify-send timeout (2 seconds), stale catch-up/queue dropping, metadata identity checks, and focus-aware app hooks. Captured-queue app regression verifies historical loads never enqueue, focused non-mentions stay quiet, new unfocused messages and true mentions enqueue, and duplicates stay quiet across focus changes. Fake helper tests verify literal -- positional arguments, markup escaping, missing/failing helpers, and killing a hung helper. Initial full default suite passed 118 tests (1 offline PTY fixture ignored); final lint/build/PTY checks underway. Actual live reception is provided by the separately developed live-updates branch, so combined event-flow acceptance remains with integration.
 
 Final validation passed: cargo test --locked (118 passed, 1 ignored); notification focused tests after final snippet fix (9 passed); cargo clippy --locked --all-targets (baseline warnings only); cargo build --locked; cargo fmt -- --check; git diff --check; offline tests/tui_mouse_pty.py normal/error/panic sessions. No actual Teams messages or real desktop alerts were sent. App service capture is available for root combined integration tests. Task remains In Progress pending integration AC 1 and 6.
+
+Combined dispatcher now defers notifications and unread classification together until user identity exists, then replays once with own-message and duplicate suppression. Linux notification daemon availability verified read-only via the user session bus.
+
+Combined integration verification complete: 147 tests passed; formatting, default Clippy, release build, and PTY mouse/focus cleanup checks passed. Release executable installed with a backup; existing user session left running until restart.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Added desktop notification policy and app hooks for incoming activity: background conversations, unfocused terminal messages, and explicit account-ID mentions enqueue sender/conversation/message previews. Own messages, foreground non-mentions, duplicate deliveries, and old catch-up messages are suppressed.
+Added desktop alerts for new messages in background conversations, messages received while the terminal is unfocused, and explicit mentions. History loads, own messages, duplicate deliveries, and stale catch-up events remain silent. Notification delivery uses a bounded asynchronous notify-send worker with literal arguments, a timeout, and the OST_NOTIFICATIONS opt-out.
 
-Delivery uses a bounded asynchronous notify-send worker with literal arguments, escaped body markup, subprocess timeout, graceful service failure, and OST_NOTIFICATIONS=off opt-out. Tests cover policy, captured app event flow, bounded queue, argument safety, and absent/failing/hung helpers. Default suite: 118 passed; Clippy/build/format/diff checks and offline terminal normal/error/panic checks passed.
-
-The independent branch consumes the shared incoming-activity contract; live delivery and reconnect/fallback acceptance are completed on the integration branch. No live message was sent or desktop alert displayed during validation.
+Integrated notification and unread handling behind one identity-aware dispatcher so early activity is replayed once after account identity becomes available. Validated policy and subprocess delivery with captured events and fake notification executables; 147 combined Rust tests, formatting, default all-targets Clippy, release build, and normal/error/panic terminal checks pass. The desktop notification daemon is available. Actual Teams push registration was verified; no real incoming test message or desktop popup was deliberately generated.
 <!-- SECTION:FINAL_SUMMARY:END -->

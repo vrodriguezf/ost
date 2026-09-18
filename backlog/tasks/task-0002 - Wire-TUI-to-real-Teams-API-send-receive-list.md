@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-02-04 22:44'
-updated_date: '2026-02-04 23:10'
+updated_date: '2026-09-18 12:16'
 labels:
   - tui
   - api-integration
@@ -27,10 +27,10 @@ This task is to replace all mock data with live Teams API calls so the TUI funct
 - [x] #2 Sidebar loads real chats/DMs from the Teams API (chats command equivalent)
 - [x] #3 Selecting a channel or chat in the sidebar loads real messages (read command equivalent)
 - [x] #4 Compose box sends real messages via the Teams API (send command equivalent)
-- [ ] #5 Incoming messages appear in real-time via trouter WebSocket push
+- [x] #5 Incoming messages appear in real-time via trouter WebSocket push
 - [x] #6 Presence indicators reflect real online/offline status from the presence API
 - [x] #7 User name and connection state in header/status bar reflect actual auth state
-- [ ] #8 Unread counts on channels and chats reflect real unread state
+- [x] #8 Unread counts on channels and chats reflect real unread state
 - [x] #9 TUI gracefully handles API errors (auth expired, network issues) without crashing
 <!-- AC:END -->
 
@@ -60,10 +60,14 @@ This task is to replace all mock data with live Teams API calls so the TUI funct
 
 <!-- SECTION:NOTES:BEGIN -->
 Implemented async backend pattern with mpsc channels bridging sync TUI and async API.\n\nReview fixes applied from MPED architect:\n- HTML-escape outgoing message content (security)\n- Fix Backend::recv() doc comment (was misleadingly described as non-blocking)\n- Deduplicate CLI functions to call _data() variants (DRY)\n- Log errors when backend cmd_tx.send() fails (observability)\n- Close search overlay on data reload to prevent stale indices (correctness)\n\nAC #5 (trouter real-time) and #8 (unread counts) deferred as follow-up tasks - require trouter WebSocket integration which is a separate concern.
+
+The previously deferred real-time push reception and unread indicators are now implemented and verified on the TUI activity integration branch.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Wire TUI to real Teams API with async backend.\n\nChanges:\n- New src/tui/backend.rs: BackendCommand/BackendResponse mpsc channel pair with per-command task spawning via Arc<TeamsClient>\n- Convert TUI event loop to async (tokio::select! + crossterm EventStream)\n- Add data-returning _data() variants for all API modules (chat, teams, me, presence); deduplicate CLI functions to call them\n- Sidebar loads real teams/channels and chats on startup\n- Selecting channel/chat loads real messages\n- Compose box sends real messages with HTML escaping\n- Header shows real user name and presence status\n- Status bar shows API errors without crashing\n- Search overlay closes on data reload to prevent stale index references\n\nNot implemented (follow-up):\n- AC #5: Trouter real-time message push\n- AC #8: Unread count indicators\n\nTested:\n- cargo fmt, cargo build, cargo test (83/83 pass)\n- Live TUI tested via tmux with real Teams account\n- MPED architect review + QA test runner review completed\n\nCommit: db2f201
+The TUI uses real Teams API data for teams, chats, message history, sending, user identity, and presence. Incoming messages now refresh automatically through a quiet push subscription with bounded fallback polling, and unread indicators use native read metadata plus per-account local state. Messaging connection health is displayed separately from presence, and API failures remain recoverable.
+
+The completed integration passed 147 Rust tests, formatting, default all-targets Clippy, release build, and terminal cleanup checks. A read-only release smoke test verified actual push registration and chat metadata loading.
 <!-- SECTION:FINAL_SUMMARY:END -->
