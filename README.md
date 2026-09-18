@@ -102,6 +102,10 @@ Keyboard navigation remains available. For terminal text selection, use your ter
 
 ### Live updates
 
+Chat names remain stable when refreshes omit a title or change the latest sender.
+Explicit title changes still appear. Opening an unresolved chat can recover its
+label from a named participant in message history, excluding your own replies.
+
 The TUI subscribes to incoming chat activity automatically. It refreshes the open
 conversation and recent-chat list without input, and checks for missed updates
 every 30 seconds. Each reconciliation reads up to 50 recent conversations and 50

@@ -93,6 +93,7 @@ impl Harness {
                 name: format!("Chat {i:02}"),
                 id: format!("chat-{i}"),
                 is_group: false,
+                name_source: crate::api::ChatNameSource::Topic,
                 unread: Default::default(),
                 online: false,
             })
@@ -204,6 +205,7 @@ fn clicks_after_backend_reorder_open_the_displayed_chat() {
             id: format!("chat-{i}"),
             name: format!("Chat {i:02}"),
             is_group: false,
+            name_source: crate::api::ChatNameSource::Topic,
             last_message_id: None,
             last_message_sender_id: None,
             last_message_type: None,

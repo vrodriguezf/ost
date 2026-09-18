@@ -33,6 +33,7 @@ fn chat(id: &str) -> api::ChatInfo {
         id: id.into(),
         name: format!("Chat {id}"),
         is_group: false,
+        name_source: crate::api::ChatNameSource::Topic,
         last_message_id: None,
         last_message_sender_id: None,
         last_message_type: None,
@@ -48,7 +49,7 @@ fn fixture() -> (App, Backend, Terminal<TestBackend>) {
     let mut app = App::new(LogBuffer::new());
     app.current_user_id = Some("self".into());
     app.current_chat_id = Some("chat".into());
-    app.sidebar.update_chats(vec![chat("chat")]);
+    app.sidebar.update_chats(vec![chat("chat")], Some("self"));
     app.sidebar.loading = false;
     let (backend, _) = Backend::for_test();
     let terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -171,13 +172,13 @@ fn sidebar_reorder_preserves_identity_badges_collapsed_teams_and_selection() {
     };
     app.sidebar.update_teams(teams());
     app.sidebar.teams[0].expanded = false;
-    app.sidebar.update_chats(vec![chat("other"), chat("chat")]);
+    app.sidebar.update_chats(vec![chat("other"), chat("chat")], Some("self"));
     app.sidebar.selected = app.sidebar.item_count() - 1;
     app.observe_incoming(&incoming("1"));
     let mut event = incoming("2");
     event.chat_id = "channel".into();
     app.observe_incoming(&event);
-    app.sidebar.update_chats(vec![chat("chat"), chat("other")]);
+    app.sidebar.update_chats(vec![chat("chat"), chat("other")], Some("self"));
     app.sidebar.update_teams(teams());
     assert_eq!(app.sidebar.selected_item_id().as_deref(), Some("chat"));
     assert_eq!(app.sidebar.chats[0].unread.count, 1);

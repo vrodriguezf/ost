@@ -83,23 +83,26 @@ fn strip_html(html: &str) -> String {
 }
 
 /// Display name for a conversation.
-fn conversation_name(conv: &Conversation) -> String {
+fn conversation_name(conv: &Conversation) -> (String, ChatNameSource) {
     if let Some(ref props) = conv.thread_properties {
         if let Some(ref topic) = props.topic {
-            if !topic.is_empty() {
-                return topic.clone();
+            if !topic.trim().is_empty() {
+                return (topic.trim().to_owned(), ChatNameSource::Topic);
             }
         }
     }
     // Fall back to last message sender or the thread ID
     if let Some(ref msg) = conv.last_message {
         if let Some(ref name) = msg.im_display_name {
-            if !name.is_empty() {
-                return name.clone();
+            if !name.trim().is_empty() {
+                return (name.trim().to_owned(), ChatNameSource::LastSender);
             }
         }
     }
-    conv.id.as_deref().unwrap_or("[unknown]").to_string()
+    (
+        conv.id.as_deref().unwrap_or("[unknown]").to_string(),
+        ChatNameSource::Identifier,
+    )
 }
 
 /// List recent chats using the native Teams API (prints to stdout).
@@ -194,11 +197,20 @@ pub async fn send_message_with_client(
 // Data-returning API functions for TUI integration
 // ---------------------------------------------------------------------------
 
+/// A message sender is only a naming hint, never a conversation rename.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatNameSource {
+    Topic,
+    LastSender,
+    Identifier,
+}
+
 /// Chat metadata for TUI display.
 #[allow(dead_code)]
 pub struct ChatInfo {
     pub id: String,
     pub name: String,
+    pub name_source: ChatNameSource,
     pub is_group: bool,
     pub last_message_id: Option<String>,
     pub last_message_sender_id: Option<String>,
@@ -290,7 +302,7 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
             continue;
         }
 
-        let name = conversation_name(conv);
+        let (name, name_source) = conversation_name(conv);
         let is_group = id.contains("thread") || id.contains("meeting");
 
         let (last_time, last_sender, last_preview) = if let Some(ref msg) = conv.last_message {
@@ -322,6 +334,7 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
         chats.push(ChatInfo {
             id,
             name,
+            name_source,
             is_group,
             last_message_id: conv.last_message.as_ref().and_then(|m| m.id.clone()),
             last_message_sender_id: conv.last_message.as_ref().and_then(|m| m.from.clone()),
@@ -446,6 +459,36 @@ fn explicit_mentions(properties: Option<&serde_json::Value>) -> Vec<String> {
 #[cfg(test)]
 mod live_message_tests {
     use super::*;
+    #[test]
+    fn conversation_names_distinguish_titles_from_sender_hints_and_missing_metadata() {
+        let conversation = |value| serde_json::from_value::<Conversation>(value).unwrap();
+        assert_eq!(
+            conversation_name(&conversation(serde_json::json!({
+                "id":"thread", "threadProperties":{"topic":" Project room "},
+                "lastMessage":{"imdisplayname":"Someone"}
+            }))),
+            ("Project room".into(), ChatNameSource::Topic)
+        );
+        assert_eq!(
+            conversation_name(&conversation(serde_json::json!({
+                "id":"thread", "threadProperties":{"topic":" "},
+                "lastMessage":{"imdisplayname":" Colleague "}
+            }))),
+            ("Colleague".into(), ChatNameSource::LastSender)
+        );
+        for last_message in [
+            serde_json::json!({}),
+            serde_json::json!({"imdisplayname":" "}),
+        ] {
+            assert_eq!(
+                conversation_name(&conversation(serde_json::json!({
+                    "id":"thread", "lastMessage":last_message
+                }))),
+                ("thread".into(), ChatNameSource::Identifier)
+            );
+        }
+    }
+
     #[test]
     fn native_mentions_use_identity_not_index() {
         let props = serde_json::json!({"mentions": "[{\"mri\":\"8:orgid:other\",\"itemid\":\"0\"},{\"itemid\":\"1\"}]"});

@@ -636,7 +636,9 @@ impl App {
                     self.unread
                         .observe_chat(chat, self.current_user_id.as_deref());
                 }
-                self.sidebar.update_chats(chats);
+                self.sidebar
+                    .update_chats(chats, self.current_user_id.as_deref());
+                self.sync_chat_header();
                 self.sidebar.apply_unread(&self.unread);
                 self.sidebar.loading = false;
             }
@@ -649,6 +651,17 @@ impl App {
                 if self.current_chat_id.as_deref() == Some(&chat_id) {
                     match result {
                         Ok(msgs) => {
+                            for message in msgs.iter().rev() {
+                                if self.sidebar.recover_chat_name(
+                                    &chat_id,
+                                    &message.sender_id,
+                                    &message.sender,
+                                    self.current_user_id.as_deref(),
+                                ) {
+                                    break;
+                                }
+                            }
+                            self.sync_chat_header();
                             self.unread.observe_history(
                                 &chat_id,
                                 &msgs,
@@ -769,9 +782,30 @@ impl App {
 
     fn dispatch_incoming(&mut self, message: &IncomingMessage) {
         if self.current_user_id.is_some() {
+            if self.sidebar.recover_chat_name(
+                &message.chat_id,
+                &message.sender_id,
+                &message.sender,
+                self.current_user_id.as_deref(),
+            ) {
+                self.sync_chat_header();
+            }
             self.notify_incoming(message);
         }
         self.observe_incoming(message);
+    }
+
+    fn sync_chat_header(&mut self) {
+        if let Some(chat) = self
+            .sidebar
+            .chats
+            .iter()
+            .find(|chat| self.current_chat_id.as_deref() == Some(chat.id.as_str()))
+        {
+            self.channel_name = chat.name.clone();
+            // A label change must not be mistaken for opening a different chat.
+            self.messages.channel_header = chat.name.clone();
+        }
     }
 
     pub fn observe_incoming(&mut self, message: &IncomingMessage) {
@@ -994,6 +1028,7 @@ mod notification_tests {
             id: "chat".into(),
             name: "Research".into(),
             is_group: true,
+            name_source: crate::api::ChatNameSource::Topic,
             unread: Default::default(),
             online: false,
         });

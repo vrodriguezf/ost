@@ -41,6 +41,7 @@ pub struct Team {
 #[derive(Clone)]
 pub struct Chat {
     pub name: String,
+    pub name_source: api::ChatNameSource,
     /// The real chat/conversation thread ID from the API.
     pub id: String,
     /// true = group chat (shows a different icon)
@@ -107,26 +108,73 @@ impl SidebarState {
     }
 
     /// Update chats data from API response.
-    pub fn update_chats(&mut self, chats: Vec<api::ChatInfo>) {
+    pub fn update_chats(&mut self, chats: Vec<api::ChatInfo>, current_user: Option<&str>) {
         let selected = self.selection_key();
         let old = std::mem::take(&mut self.chats);
         self.chats = chats
             .into_iter()
-            .map(|c| Chat {
-                name: c.name,
-                unread: old
-                    .iter()
-                    .find(|old| old.id == c.id)
-                    .map_or(Badge::default(), |old| old.unread),
-                online: old
-                    .iter()
-                    .find(|old| old.id == c.id)
-                    .is_some_and(|old| old.online),
-                id: c.id,
-                is_group: c.is_group,
+            .map(|c| {
+                let previous = old.iter().find(|old| old.id == c.id);
+                let known = previous.filter(|old| {
+                    old.name_source != api::ChatNameSource::Identifier
+                        && !old.name.trim().is_empty()
+                });
+                let peer_name = c.name_source == api::ChatNameSource::LastSender
+                    && current_user
+                        .zip(c.last_message_sender_id.as_deref())
+                        .is_some_and(|(user, sender)| {
+                            !sender.is_empty() && !super::unread::same_user(user, sender)
+                        });
+                let (name, name_source) =
+                    if c.name_source == api::ChatNameSource::Topic && !c.name.trim().is_empty() {
+                        (c.name, c.name_source)
+                    } else if let Some(known) = known {
+                        (known.name.clone(), known.name_source)
+                    } else if peer_name && !c.name.trim().is_empty() {
+                        (c.name, c.name_source)
+                    } else {
+                        (c.id.clone(), api::ChatNameSource::Identifier)
+                    };
+                Chat {
+                    name,
+                    name_source,
+                    unread: previous.map_or(Badge::default(), |old| old.unread),
+                    online: previous.is_some_and(|old| old.online),
+                    id: c.id,
+                    is_group: c.is_group,
+                }
             })
             .collect();
         self.restore_selection(selected);
+    }
+
+    /// An unresolved label may be recovered from a named peer, never our own reply.
+    pub fn recover_chat_name(
+        &mut self,
+        chat_id: &str,
+        sender_id: &str,
+        sender: &str,
+        current_user: Option<&str>,
+    ) -> bool {
+        let Some(user) = current_user else {
+            return false;
+        };
+        if sender_id.is_empty() || super::unread::same_user(user, sender_id) {
+            return false;
+        }
+        let name = sender.trim();
+        if name.is_empty() || name == "?" || name == "[unknown]" || name == sender_id {
+            return false;
+        }
+        let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == chat_id) else {
+            return false;
+        };
+        if chat.name_source != api::ChatNameSource::Identifier {
+            return false;
+        }
+        chat.name = name.to_owned();
+        chat.name_source = api::ChatNameSource::LastSender;
+        true
     }
 
     pub fn apply_unread(&mut self, state: &UnreadState) {

@@ -473,6 +473,7 @@ mod tests {
             id: id.into(),
             name: "Chat".into(),
             is_group: false,
+            name_source: crate::api::ChatNameSource::Topic,
             last_message_id: Some(last.into()),
             last_message_sender_id: Some("8:orgid:other".into()),
             last_message_type: Some("Text".into()),

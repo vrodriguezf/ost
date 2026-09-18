@@ -35,6 +35,7 @@ fn chat(id: &str) -> ChatInfo {
         id: id.into(),
         name: format!("Conversation {id}"),
         is_group: false,
+        name_source: crate::api::ChatNameSource::Topic,
         last_message_id: None,
         last_message_sender_id: None,
         last_message_type: None,
@@ -68,6 +69,110 @@ fn draw(app: &mut App, terminal: &mut Terminal<TestBackend>) {
     if app.acknowledge_rendered() {
         terminal.draw(|frame| app.render(frame)).unwrap();
     }
+}
+
+#[test]
+fn chat_refresh_after_a_reply_never_replaces_a_known_name_with_an_id() {
+    let (mut app, backend, _) = setup();
+    let mut named = chat("active");
+    named.name = "Colleague".into();
+    app.handle_backend_response(BackendResponse::Chats(Ok(vec![named])), &backend);
+
+    // Native replies can lack both a topic and lastMessage.imdisplayname.
+    let mut reply_snapshot = chat("active");
+    reply_snapshot.name = reply_snapshot.id.clone();
+    reply_snapshot.name_source = crate::api::ChatNameSource::Identifier;
+    reply_snapshot.last_message_sender_id = Some("8:orgid:me".into());
+    app.handle_backend_response(BackendResponse::Chats(Ok(vec![reply_snapshot])), &backend);
+    assert_eq!(app.sidebar.chats[0].name, "Colleague");
+}
+
+#[test]
+fn sender_hints_keep_names_stable_and_real_renames_update_every_label() {
+    let (mut app, backend, mut alerts) = setup();
+    app.compose.input = "Keep this draft".into();
+    app.messages.viewport.follow_selection = false;
+    app.messages.viewport.offset = 3;
+    app.search.activate();
+    app.search.query = "Conversation".into();
+
+    let mut sender_hint = chat("active");
+    sender_hint.name = "My own name".into();
+    sender_hint.name_source = crate::api::ChatNameSource::LastSender;
+    sender_hint.last_message_sender_id = Some("8:orgid:me".into());
+    app.handle_backend_response(
+        BackendResponse::Chats(Ok(vec![chat("background"), sender_hint])),
+        &backend,
+    );
+    assert_eq!(app.sidebar.selected_item_id().as_deref(), Some("active"));
+    assert_eq!(app.sidebar.chats[1].name, "Conversation active");
+    assert_eq!(app.channel_name, "Conversation active");
+    assert_eq!(app.messages.channel_header, "Conversation active");
+    assert!(app.search.active);
+    assert_eq!(app.compose.input, "Keep this draft");
+    assert_eq!(app.messages.viewport.offset, 3);
+
+    let mut renamed = chat("active");
+    renamed.name = "Project room".into();
+    app.handle_backend_response(BackendResponse::Chats(Ok(vec![renamed])), &backend);
+    assert_eq!(app.sidebar.chats[0].name, "Project room");
+    assert_eq!(app.channel_name, "Project room");
+    assert_eq!(app.messages.channel_header, "Project room");
+    assert_eq!(app.messages.viewport.offset, 3);
+    app.terminal_focused = false;
+    app.handle_backend_response(
+        BackendResponse::IncomingMessage(message("active", "after-rename")),
+        &backend,
+    );
+    assert!(alerts
+        .try_recv()
+        .unwrap()
+        .notification
+        .summary
+        .contains("Project room"));
+    assert_eq!(app.unread.badge("active").count, 1);
+}
+
+#[test]
+fn history_recovers_an_unresolved_name_from_a_peer_without_renaming_known_chats() {
+    let (mut app, backend, mut alerts) = setup();
+    let mut unresolved = chat("active");
+    unresolved.name = "My own name".into();
+    unresolved.name_source = crate::api::ChatNameSource::LastSender;
+    unresolved.last_message_sender_id = Some("8:orgid:me".into());
+    app.sidebar.chats.clear();
+    app.handle_backend_response(BackendResponse::Chats(Ok(vec![unresolved])), &backend);
+    assert_eq!(app.sidebar.chats[0].name, "active");
+
+    let peer = message("active", "1");
+    let mut own = message("active", "2");
+    own.sender = "Me".into();
+    own.sender_id = "8:orgid:me".into();
+    app.handle_backend_response(
+        BackendResponse::Messages {
+            chat_id: "active".into(),
+            result: Ok(vec![history(&peer), history(&own)]),
+        },
+        &backend,
+    );
+    assert_eq!(app.sidebar.chats[0].name, "Colleague");
+    assert_eq!(app.channel_name, "Colleague");
+    assert_eq!(app.messages.channel_header, "Colleague");
+    assert!(
+        alerts.try_recv().is_err(),
+        "History must not trigger an alert"
+    );
+
+    let mut another = message("active", "3");
+    another.sender = "Another participant".into();
+    app.handle_backend_response(
+        BackendResponse::Messages {
+            chat_id: "active".into(),
+            result: Ok(vec![history(&another)]),
+        },
+        &backend,
+    );
+    assert_eq!(app.sidebar.chats[0].name, "Colleague");
 }
 
 #[test]

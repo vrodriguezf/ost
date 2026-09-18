@@ -579,6 +579,7 @@ mod tests {
             last_message_id: Some("1000".into()),
             name: "Chat".into(),
             is_group: false,
+            name_source: crate::api::ChatNameSource::Topic,
             last_message_sender_id: None,
             last_message_type: None,
             unread_count: None,
