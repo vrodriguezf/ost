@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use super::mouse::{HitMap, Target, Viewport};
+use super::unread::{Badge, UnreadState};
 use crate::api;
 
 // ---------------------------------------------------------------------------
@@ -21,8 +22,8 @@ pub struct Channel {
     pub name: String,
     /// The real channel/thread ID from the API.
     pub id: String,
-    /// Number of unread messages (0 = no badge)
-    pub unread: u32,
+    /// Known incoming count and an optional unknown historical backlog.
+    pub unread: Badge,
 }
 
 /// A team containing channels.
@@ -44,8 +45,8 @@ pub struct Chat {
     pub id: String,
     /// true = group chat (shows a different icon)
     pub is_group: bool,
-    /// Number of unread messages (0 = no badge, use dot for "some")
-    pub unread: u32,
+    /// Known incoming count and an optional unknown historical backlog.
+    pub unread: Badge,
     /// Whether this contact is online (show presence dot)
     pub online: bool,
 }
@@ -76,38 +77,87 @@ impl Default for SidebarState {
 impl SidebarState {
     /// Update teams data from API response.
     pub fn update_teams(&mut self, teams: Vec<api::TeamInfo>) {
+        let selected = self.selection_key();
+        let old = std::mem::take(&mut self.teams);
         self.teams = teams
             .into_iter()
             .map(|t| Team {
                 name: t.name,
+                expanded: old
+                    .iter()
+                    .find(|old| old.id == t.id)
+                    .is_none_or(|old| old.expanded),
                 id: t.id,
-                expanded: true,
                 channels: t
                     .channels
                     .into_iter()
                     .map(|c| Channel {
                         name: c.name,
+                        unread: old
+                            .iter()
+                            .flat_map(|t| &t.channels)
+                            .find(|old| old.id == c.id)
+                            .map_or(Badge::default(), |old| old.unread),
                         id: c.id,
-                        unread: 0,
                     })
                     .collect(),
             })
             .collect();
-        self.clamp_selection();
+        self.restore_selection(selected);
     }
 
     /// Update chats data from API response.
     pub fn update_chats(&mut self, chats: Vec<api::ChatInfo>) {
+        let selected = self.selection_key();
+        let old = std::mem::take(&mut self.chats);
         self.chats = chats
             .into_iter()
             .map(|c| Chat {
                 name: c.name,
+                unread: old
+                    .iter()
+                    .find(|old| old.id == c.id)
+                    .map_or(Badge::default(), |old| old.unread),
+                online: old
+                    .iter()
+                    .find(|old| old.id == c.id)
+                    .is_some_and(|old| old.online),
                 id: c.id,
                 is_group: c.is_group,
-                unread: 0,
-                online: false,
             })
             .collect();
+        self.restore_selection(selected);
+    }
+
+    pub fn apply_unread(&mut self, state: &UnreadState) {
+        for chat in &mut self.chats {
+            chat.unread = state.badge(&chat.id);
+        }
+        for channel in self.teams.iter_mut().flat_map(|team| &mut team.channels) {
+            channel.unread = state.badge(&channel.id);
+        }
+    }
+
+    fn selection_key(&self) -> Option<(bool, String)> {
+        match self.flat_items().get(self.selected)? {
+            SidebarItem::Team(index) => Some((true, self.teams[*index].id.clone())),
+            _ => self.selected_item_id().map(|id| (false, id)),
+        }
+    }
+
+    fn restore_selection(&mut self, selected: Option<(bool, String)>) {
+        if let Some((is_team, id)) = selected {
+            if let Some(index) = self.flat_items().iter().position(|item| match item {
+                SidebarItem::Team(index) => is_team && self.teams[*index].id == id,
+                SidebarItem::Channel(team, channel) => {
+                    !is_team && self.teams[*team].channels[*channel].id == id
+                }
+                SidebarItem::Chat(index) => !is_team && self.chats[*index].id == id,
+                _ => false,
+            }) {
+                self.selected = index;
+            }
+        }
         self.clamp_selection();
     }
 
@@ -417,21 +467,38 @@ fn render_item(buf: &mut Buffer, ctx: &RowCtx, item: &SidebarItem, state: &Sideb
                 Style::default().fg(Color::White)
             };
 
-            render_row(buf, ctx.area, &label, "", style, style);
+            let unread = team
+                .channels
+                .iter()
+                .fold(Badge::default(), |sum, channel| sum.combine(channel.unread));
+            let badge = if team.expanded {
+                String::new()
+            } else {
+                unread.label()
+            };
+            let style = if unread.any() {
+                style.add_modifier(Modifier::BOLD)
+            } else {
+                style
+            };
+            render_row(
+                buf,
+                ctx.area,
+                &label,
+                &badge,
+                style,
+                badge_style(ctx.selected),
+            );
         }
 
         SidebarItem::Channel(ti, ci) => {
             let channel = &state.teams[*ti].channels[*ci];
             let cursor = if ctx.selected { "\u{25BA}" } else { " " };
             let label = format!("  {}# {}", cursor, channel.name);
-            let badge = if channel.unread > 0 {
-                format!("{}", channel.unread)
-            } else {
-                String::new()
-            };
+            let badge = channel.unread.label();
 
-            let style = item_style(ctx.selected, channel.unread > 0);
-            let bstyle = if channel.unread > 0 {
+            let style = item_style(ctx.selected, channel.unread.any());
+            let bstyle = if channel.unread.any() {
                 badge_style(ctx.selected)
             } else {
                 style
@@ -458,16 +525,16 @@ fn render_item(buf: &mut Buffer, ctx: &RowCtx, item: &SidebarItem, state: &Sideb
             };
             let cursor = if ctx.selected { "\u{25BA}" } else { " " };
             let label = format!("{}{} {}", cursor, icon, chat.name);
-            let badge = if chat.unread > 0 {
-                format!("{}", chat.unread)
+            let badge = if chat.unread.any() {
+                chat.unread.label()
             } else if chat.online {
                 "*".to_string()
             } else {
                 String::new()
             };
 
-            let style = item_style(ctx.selected, chat.unread > 0);
-            let bstyle = if chat.unread > 0 {
+            let style = item_style(ctx.selected, chat.unread.any());
+            let bstyle = if chat.unread.any() {
                 badge_style(ctx.selected)
             } else if chat.online {
                 Style::default().fg(Color::Green)

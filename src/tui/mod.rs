@@ -16,6 +16,7 @@ mod search;
 mod sidebar;
 mod text_input;
 mod ui;
+mod unread;
 
 pub use app::run;
 pub use log_capture::LogBuffer;

@@ -72,6 +72,9 @@ pub struct MessagesState {
     pub loading: bool,
     scroll_anchor: Option<(String, usize)>,
     restore_anchor: bool,
+
+    /// True only when the current render exposes the end of the newest message.
+    pub rendered_latest: bool,
 }
 
 impl Default for MessagesState {
@@ -85,6 +88,8 @@ impl Default for MessagesState {
             loading: false,
             scroll_anchor: None,
             restore_anchor: false,
+
+            rendered_latest: false,
         }
     }
 }
@@ -101,6 +106,8 @@ impl MessagesState {
             .messages
             .get(self.selected)
             .map(|message| message.id.clone());
+
+        self.rendered_latest = false;
         self.channel_header = header.to_string();
         if initial {
             self.messages.clear();
@@ -197,6 +204,7 @@ pub fn render(
     user_name: &str,
     hits: &mut HitMap,
 ) {
+    state.rendered_latest = false;
     hits.add(area, Target::Messages);
     let border_style = if focused {
         Style::default().fg(Color::Yellow)
@@ -306,6 +314,8 @@ pub fn render(
                 scroll.saturating_sub(*start),
             )
         });
+
+    state.rendered_latest = scroll.saturating_add(visible_height) >= total_lines;
 
     // Use the very same line ranges as the renderer, including wrapped replies.
     // The separating blank line is deliberately not a message click target.
