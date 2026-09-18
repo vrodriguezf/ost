@@ -100,6 +100,18 @@ Mouse controls are enabled automatically:
 
 Keyboard navigation remains available. For terminal text selection, use your terminal's mouse-capture override (commonly Shift+drag). Mouse capture is released when OST exits.
 
+Desktop alerts use `notify-send` and your Linux desktop notification daemon. New messages in other conversations, messages received while the terminal is unfocused, and explicit mentions of your account can trigger alerts containing the sender, conversation name, and a short message preview. Ordinary messages in the focused conversation are quiet. Focus detection depends on terminal support; typing or clicking also establishes focus. Before the first focus event or interaction, OST treats the terminal as unfocused.
+
+Your own messages, history loads, repeated deliveries, and messages more than two minutes old do not trigger alerts. Mentions use account IDs from Teams metadata; writing your display name in plain text is not a mention. Alerts wait until your account identity is available. A missing helper or notification daemon is nonfatal and logged in the debug pane. Delivery runs asynchronously with a bounded queue and timeout; excess or delayed alerts may be dropped during a burst or desktop-service stall.
+
+To disable desktop alerts (including message previews), launch with:
+
+```bash
+OST_NOTIFICATIONS=off teams-cli tui
+```
+
+The values `0`, `false`, and `no` also disable alerts. Notifications are enabled by default.
+
 ### Authentication
 
 Login with device code flow:
