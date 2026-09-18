@@ -73,6 +73,11 @@ impl MessageStamp {
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Conversation {
+    #[serde(default)]
+    manual_unread: bool,
+    /// Ignore repeated unversioned server badges after an explicit local read.
+    #[serde(default)]
+    acknowledged_unstamped: bool,
     latest: Option<MessageStamp>,
     read_horizon: Option<MessageStamp>,
     seen: BTreeMap<String, MessageStamp>,
@@ -179,7 +184,7 @@ impl UnreadState {
                 .unwrap_or(0)
                 .saturating_add(beyond_snapshot)
                 .max(conversation.pending.len() as u32),
-            unknown: conversation.unknown,
+            unknown: conversation.unknown || conversation.manual_unread,
         }
     }
 
@@ -224,7 +229,7 @@ impl UnreadState {
                 .as_ref()
                 .is_some_and(|old| stamp.at_or_before(old))
         });
-        if !acknowledged {
+        if !(acknowledged || latest.is_none() && state.acknowledged_unstamped) {
             if let Some(count) = chat.unread_count {
                 state.server_count = Some(count);
                 state.server_snapshot = latest.clone();
@@ -326,12 +331,33 @@ impl UnreadState {
         true
     }
 
+    /// Toggle local activity without changing Teams read receipts.
+    pub fn toggle(&mut self, chat_id: &str) -> bool {
+        let mark_unread = !self.badge(chat_id).any();
+        let state = self.conversations.entry(chat_id.to_owned()).or_default();
+        state.manual_unread = mark_unread;
+        if !mark_unread {
+            if let Some(latest) = state.latest.clone() {
+                acknowledge_state(state, &latest);
+            }
+            state.pending.clear();
+            state.unknown = false;
+            state.unknown_horizon = None;
+            state.server_count = None;
+            state.server_snapshot = None;
+            state.acknowledged_unstamped = true;
+        }
+        self.dirty = true;
+        mark_unread
+    }
+
     /// Call only after a successful draw has exposed the newest loaded content.
     pub fn acknowledge(&mut self, chat_id: &str, displayed: &MessageStamp) {
         let Some(state) = self.conversations.get_mut(chat_id) else {
             return;
         };
         let before = state.clone();
+        state.manual_unread = false;
         acknowledge_state(state, displayed);
         self.dirty |= *state != before;
     }
@@ -483,6 +509,47 @@ mod tests {
             unread_count: None,
             has_unread: unread,
         }
+    }
+
+    #[test]
+    fn manual_unread_survives_refresh_and_disk_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("ost-toggle-{}", uuid::Uuid::new_v4()));
+        let path = account_path(&dir, "tenant", "user");
+        let mut state = UnreadState::load_path(&path).unwrap();
+        state.observe_history("chat", &[message("1")], Some("self"));
+        assert!(state.toggle("chat"));
+        state.observe_chat(&chat("chat", "1", Some(false)), Some("self"));
+        assert_eq!(state.badge("chat").label(), "●");
+        state.save().unwrap();
+        let mut restored = UnreadState::load_path(&path).unwrap();
+        assert_eq!(restored.badge("chat").label(), "●");
+        assert!(restored.incoming(&event("chat", "2"), Some("self")));
+        assert_eq!(restored.badge("chat").label(), "1+");
+        assert!(!restored.toggle("chat"));
+        restored.observe_chat(&chat("chat", "2", Some(true)), Some("self"));
+        assert!(!restored.badge("chat").any());
+        assert!(restored.incoming(&event("chat", "3"), Some("self")));
+        assert_eq!(restored.badge("chat").label(), "1");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_state_loads_and_unstamped_counts_can_be_cleared() {
+        let mut state = UnreadState::default();
+        let mut snapshot = chat("chat", "1", Some(true));
+        snapshot.last_message_id = None;
+        snapshot.unread_count = Some(4);
+        state.observe_chat(&snapshot, Some("self"));
+        let mut json = serde_json::to_value(&state).unwrap();
+        let conversation = json["conversations"]["chat"].as_object_mut().unwrap();
+        conversation.remove("manual_unread");
+        conversation.remove("acknowledged_unstamped");
+        let mut restored: UnreadState = serde_json::from_value(json).unwrap();
+        assert!(!restored.toggle("chat"));
+        restored.observe_chat(&snapshot, Some("self"));
+        assert!(!restored.badge("chat").any());
+        assert!(restored.incoming(&event("chat", "2"), Some("self")));
+        assert_eq!(restored.badge("chat").count, 1);
     }
 
     #[test]

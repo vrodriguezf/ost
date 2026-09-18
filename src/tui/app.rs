@@ -92,6 +92,8 @@ pub struct App {
     /// Newest loaded identity; selection or loading alone never acknowledges it.
     pub loaded_last_stamp: Option<MessageStamp>,
     rendered_chat_id: Option<String>,
+    /// Hold a manual unread reminder until this conversation is left.
+    manual_unread_hold: Option<String>,
     deferred_incoming: Vec<IncomingMessage>,
 }
 
@@ -124,6 +126,7 @@ impl App {
             unread: UnreadState::default(),
             loaded_last_stamp: None,
             rendered_chat_id: None,
+            manual_unread_hold: None,
             deferred_incoming: Vec::new(),
         }
     }
@@ -319,6 +322,9 @@ impl App {
     /// Handle key events when a non-compose pane is focused.
     fn handle_navigation_key(&mut self, key_event: crossterm::event::KeyEvent, backend: &Backend) {
         match key_event.code {
+            KeyCode::Char('u') if key_event.modifiers.is_empty() => {
+                self.toggle_chat_unread();
+            }
             KeyCode::Char('q') => {
                 self.should_exit = true;
             }
@@ -372,6 +378,32 @@ impl App {
         }
     }
 
+    fn toggle_chat_unread(&mut self) {
+        let chat_id = match self.active_pane {
+            Pane::Sidebar => self.sidebar.selected_item_id(),
+            Pane::Messages => self.current_chat_id.clone(),
+            Pane::Compose => None,
+        };
+        let Some(chat_id) = chat_id else { return };
+        let marked_unread = self.unread.toggle(&chat_id);
+        if self.current_chat_id.as_deref() == Some(&chat_id) {
+            self.manual_unread_hold = marked_unread.then_some(chat_id);
+        }
+        self.sidebar.apply_unread(&self.unread);
+        self.status_is_error = false;
+        self.status_message = Some(
+            if marked_unread {
+                "Marked unread"
+            } else {
+                "Marked read"
+            }
+            .into(),
+        );
+        if let Err(error) = self.unread.save() {
+            self.set_error(format!("Unread state not saved: {error:#}"));
+        }
+    }
+
     /// Handle Enter key on a sidebar item.
     ///
     /// If the selected item is a team, toggle expand/collapse.
@@ -391,6 +423,9 @@ impl App {
             super::sidebar::SidebarItem::Channel(_, _) | super::sidebar::SidebarItem::Chat(_) => {
                 if let Some(id) = self.sidebar.selected_item_id() {
                     let name = self.sidebar.selected_item_name().unwrap_or_default();
+                    if self.current_chat_id.as_deref() != Some(&id) {
+                        self.manual_unread_hold = None;
+                    }
                     self.current_chat_id = Some(id.clone());
                     self.channel_name = name.clone();
                     self.messages.loading = true;
@@ -842,7 +877,9 @@ impl App {
             .map(|id| self.unread.badge(id));
         self.rendered_chat_id = self.current_chat_id.clone();
         if let (Some(chat_id), Some(stamp)) = (&self.current_chat_id, &self.loaded_last_stamp) {
-            if self.is_reading_latest(chat_id) {
+            if self.is_reading_latest(chat_id)
+                && self.manual_unread_hold.as_deref() != Some(chat_id)
+            {
                 self.unread.acknowledge(chat_id, stamp);
                 self.sidebar.apply_unread(&self.unread);
             }
@@ -1091,3 +1128,7 @@ mod notification_tests {
 #[cfg(test)]
 #[path = "activity_tests.rs"]
 mod activity_tests;
+
+#[cfg(test)]
+#[path = "unread_tests.rs"]
+mod unread_tests;

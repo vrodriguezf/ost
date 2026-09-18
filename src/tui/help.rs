@@ -28,6 +28,10 @@ const NAVIGATION: Category = Category {
     title: "NAVIGATION",
     shortcuts: &[
         Shortcut {
+            key: "u",
+            desc: "Toggle chat read/unread",
+        },
+        Shortcut {
             key: "Up/Down",
             desc: "Move within pane",
         },

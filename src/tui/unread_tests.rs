@@ -172,13 +172,15 @@ fn sidebar_reorder_preserves_identity_badges_collapsed_teams_and_selection() {
     };
     app.sidebar.update_teams(teams());
     app.sidebar.teams[0].expanded = false;
-    app.sidebar.update_chats(vec![chat("other"), chat("chat")], Some("self"));
+    app.sidebar
+        .update_chats(vec![chat("other"), chat("chat")], Some("self"));
     app.sidebar.selected = app.sidebar.item_count() - 1;
     app.observe_incoming(&incoming("1"));
     let mut event = incoming("2");
     event.chat_id = "channel".into();
     app.observe_incoming(&event);
-    app.sidebar.update_chats(vec![chat("chat"), chat("other")], Some("self"));
+    app.sidebar
+        .update_chats(vec![chat("chat"), chat("other")], Some("self"));
     app.sidebar.update_teams(teams());
     assert_eq!(app.sidebar.selected_item_id().as_deref(), Some("chat"));
     assert_eq!(app.sidebar.chats[0].unread.count, 1);
@@ -214,4 +216,97 @@ fn incoming_before_identity_load_is_deferred_and_self_is_filtered() {
     assert!(!app.unread.badge("chat").any());
     app.load_unread_account("unused-test", "self");
     assert_eq!(app.unread.badge("chat").count, 1);
+}
+
+fn press_u(app: &mut App, backend: &Backend) {
+    app.handle_event(
+        Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::NONE,
+        )),
+        backend,
+    );
+}
+
+fn select_chat(app: &mut App, id: &str) {
+    app.sidebar.selected = app.sidebar.flat_items().iter().position(|item| {
+        matches!(item, super::super::sidebar::SidebarItem::Chat(index) if app.sidebar.chats[*index].id == id)
+    }).unwrap();
+}
+
+#[test]
+fn manual_unread_waits_for_leave_reopen_and_successful_latest_render() {
+    let (mut app, backend, mut terminal) = fixture();
+    app.active_pane = Pane::Messages;
+    load(&mut app, &backend, vec![message("1", 1)]);
+    press_u(&mut app, &backend);
+    for _ in 0..2 {
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        app.acknowledge_rendered();
+        assert_eq!(app.unread.badge("chat").label(), "●");
+    }
+    app.sidebar
+        .update_chats(vec![chat("chat"), chat("other")], Some("self"));
+    select_chat(&mut app, "chat");
+    app.handle_sidebar_enter(&backend); // Reopening the same chat is not leaving it.
+    load(&mut app, &backend, vec![message("1", 1)]);
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    app.acknowledge_rendered();
+    assert!(app.unread.badge("chat").any());
+    select_chat(&mut app, "other");
+    app.handle_sidebar_enter(&backend);
+    select_chat(&mut app, "chat");
+    app.handle_sidebar_enter(&backend);
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    app.acknowledge_rendered();
+    assert!(app.unread.badge("chat").any()); // Loading is not reading.
+    load(&mut app, &backend, vec![message("1", 1)]);
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    app.acknowledge_rendered();
+    assert!(!app.unread.badge("chat").any());
+    press_u(&mut app, &backend);
+    press_u(&mut app, &backend);
+    assert!(!app.unread.badge("chat").any());
+    assert_eq!(app.status_message.as_deref(), Some("Marked read"));
+}
+
+#[test]
+fn toggle_targets_focus_and_preserves_text_input_and_overlays() {
+    let (mut app, backend, _) = fixture();
+    app.sidebar
+        .update_chats(vec![chat("chat"), chat("other")], Some("self"));
+    select_chat(&mut app, "other");
+    press_u(&mut app, &backend);
+    assert!(app.unread.badge("other").any());
+    assert!(!app.unread.badge("chat").any());
+    app.active_pane = Pane::Messages;
+    press_u(&mut app, &backend);
+    assert!(app.unread.badge("chat").any());
+    app.active_pane = Pane::Compose;
+    press_u(&mut app, &backend);
+    assert_eq!(app.compose.input, "u");
+    app.active_pane = Pane::Messages;
+    app.search.activate();
+    press_u(&mut app, &backend);
+    assert_eq!(app.search.query, "u");
+    app.search.deactivate();
+    app.show_help = true;
+    press_u(&mut app, &backend);
+    assert!(!app.show_help);
+    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+        app.handle_event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('u'),
+                modifiers,
+            )),
+            &backend,
+        );
+    }
+    assert!(app.unread.badge("chat").any());
+    assert!(app.unread.badge("other").any());
+    app.active_pane = Pane::Sidebar;
+    select_chat(&mut app, "other");
+    press_u(&mut app, &backend);
+    assert!(!app.unread.badge("other").any());
+    assert_eq!(app.current_chat_id.as_deref(), Some("chat"));
 }
