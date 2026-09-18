@@ -100,6 +100,14 @@ Mouse controls are enabled automatically:
 
 Keyboard navigation remains available. For terminal text selection, use your terminal's mouse-capture override (commonly Shift+drag). Mouse capture is released when OST exits.
 
+### Unread activity
+
+Unread chats and channels appear in bold with yellow badges. A number counts distinct incoming messages observed locally; a dot (`●`) means unread activity is known but its historical count is unavailable. A badge such as `2+` combines two observed messages with an unknown backlog. Collapsed teams show the combined activity of their channels. Own messages and duplicate deliveries do not add unread counts.
+
+Initial history establishes a baseline. The native conversation read watermark can seed an unread dot, but OST does not invent a historical message count. Badges and local read horizons survive sidebar refresh, reordering, and restarts. State is separated by tenant and account under the OST configuration directory's `unread/` folder and honors `XDG_CONFIG_HOME`; saved state contains message identities and timestamps, without message text or sender names.
+
+OST marks activity read locally only after the newest loaded content has been successfully drawn in a focused terminal. If Teams reports a newer read watermark from another client, OST also clears activity covered by that watermark while preserving newer arrivals. Opening a chat, loading messages in the background, scrolling through older messages, or covering the pane with help/search does not mark it read. Terminal focus reports are enabled automatically; a keypress or mouse interaction also confirms focus for terminals that do not report it. Such terminals cannot report a later switch to another window. This read state is local: OST does not send Teams read receipts or change another client's read state.
+
 ### Authentication
 
 Login with device code flow:

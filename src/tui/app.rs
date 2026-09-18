@@ -3,14 +3,15 @@
 use anyhow::Result;
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+        EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
 };
 use ratatui::DefaultTerminal;
 use tokio_stream::StreamExt;
 
+use super::activity::IncomingMessage;
 use super::backend::{Backend, BackendCommand, BackendResponse};
 use super::compose::ComposeState;
 use super::debug_log::DebugLogState;
@@ -20,6 +21,7 @@ use super::mouse::{is_actionable, HitMap, Target, WHEEL_LINES};
 use super::search::SearchState;
 use super::sidebar::SidebarState;
 use super::ui;
+use super::unread::{configured_account, MessageStamp, UnreadState};
 
 /// Active pane in the TUI
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +79,13 @@ pub struct App {
     pub debug_log: DebugLogState,
     /// Hit targets from the most recently rendered frame.
     pub mouse: HitMap,
+    pub terminal_focused: bool,
+    pub current_user_id: Option<String>,
+    pub unread: UnreadState,
+    /// Newest loaded identity; selection or loading alone never acknowledges it.
+    pub loaded_last_stamp: Option<MessageStamp>,
+    rendered_chat_id: Option<String>,
+    deferred_incoming: Vec<IncomingMessage>,
 }
 
 impl App {
@@ -100,6 +109,12 @@ impl App {
             status_is_error: false,
             debug_log: DebugLogState::new(log_buffer),
             mouse: HitMap::default(),
+            terminal_focused: false,
+            current_user_id: None,
+            unread: UnreadState::default(),
+            loaded_last_stamp: None,
+            rendered_chat_id: None,
+            deferred_incoming: Vec::new(),
         }
     }
 }
@@ -126,7 +141,16 @@ impl App {
     /// Handle a crossterm event.
     pub fn handle_event(&mut self, event: Event, backend: &Backend) {
         match event {
+            Event::FocusGained => {
+                self.terminal_focused = true;
+                return;
+            }
+            Event::FocusLost => {
+                self.terminal_focused = false;
+                return;
+            }
             Event::Mouse(mouse) => {
+                self.terminal_focused = true;
                 self.handle_mouse(mouse, backend);
                 return;
             }
@@ -141,6 +165,8 @@ impl App {
                 return;
             }
 
+            // Direct input confirms focus on terminals without focus reports.
+            self.terminal_focused = true;
             // When help popup is visible, any key closes it.
             if self.show_help {
                 self.show_help = false;
@@ -565,9 +591,11 @@ impl App {
     fn handle_backend_response(&mut self, response: BackendResponse, backend: &Backend) {
         self.mouse.clear();
         match response {
-            BackendResponse::IncomingMessage(_) | BackendResponse::ConnectionState(_) => {}
+            BackendResponse::IncomingMessage(message) => self.observe_incoming(&message),
+            BackendResponse::ConnectionState(_) => {}
             BackendResponse::Teams(Ok(teams)) => {
                 self.sidebar.update_teams(teams);
+                self.sidebar.apply_unread(&self.unread);
                 self.sidebar.loading = false;
                 self.close_stale_search();
                 // If this is the first data load and we have teams, select the first
@@ -581,7 +609,12 @@ impl App {
                 self.sidebar.loading = false;
             }
             BackendResponse::Chats(Ok(chats)) => {
+                for chat in &chats {
+                    self.unread
+                        .observe_chat(chat, self.current_user_id.as_deref());
+                }
                 self.sidebar.update_chats(chats);
+                self.sidebar.apply_unread(&self.unread);
                 self.sidebar.loading = false;
                 self.close_stale_search();
             }
@@ -594,12 +627,23 @@ impl App {
                 if self.current_chat_id.as_deref() == Some(&chat_id) {
                     match result {
                         Ok(msgs) => {
+                            self.unread.observe_history(
+                                &chat_id,
+                                &msgs,
+                                self.current_user_id.as_deref(),
+                            );
+                            self.loaded_last_stamp = msgs
+                                .last()
+                                .filter(|m| !m.id.is_empty())
+                                .map(|m| MessageStamp::new(&m.id, &m.timestamp));
+                            self.sidebar.apply_unread(&self.unread);
                             let header = self.messages.channel_header.clone();
                             self.messages.update_messages(&header, msgs);
                             self.close_stale_search();
                         }
                         Err(e) => {
                             self.messages.loading = false;
+                            self.loaded_last_stamp = None;
                             self.set_error(format!("Failed to load messages: {:#}", e));
                         }
                     }
@@ -621,6 +665,10 @@ impl App {
             }
             BackendResponse::UserInfo(Ok(info)) => {
                 self.user_name = info.display_name;
+                if self.current_user_id.is_none() {
+                    self.load_unread_account("", &info.id);
+                }
+                self.current_user_id = Some(info.id);
             }
             BackendResponse::UserInfo(Err(e)) => {
                 self.set_error(format!("Failed to load user info: {:#}", e));
@@ -648,6 +696,72 @@ impl App {
                 self.set_error(format!("Auth: {}", msg));
             }
         }
+    }
+
+    fn load_unread_account(&mut self, tenant: &str, user: &str) {
+        #[cfg(test)]
+        let _ = tenant;
+        #[cfg(not(test))]
+        match UnreadState::load_for_account(tenant, user) {
+            Ok(state) => self.unread = state,
+            Err(error) => self.set_error(format!("Unread state unavailable: {error:#}")),
+        }
+        self.current_user_id = Some(user.to_owned());
+        for message in std::mem::take(&mut self.deferred_incoming) {
+            self.unread.incoming(&message, Some(user));
+        }
+        self.sidebar.apply_unread(&self.unread);
+    }
+
+    pub fn observe_incoming(&mut self, message: &IncomingMessage) {
+        if self.current_user_id.is_none() {
+            // Do not classify our own activity as unread before identity loads.
+            if self.deferred_incoming.len() < 1024 {
+                self.deferred_incoming.push(message.clone());
+            }
+            return;
+        }
+        self.unread
+            .incoming(message, self.current_user_id.as_deref());
+        self.sidebar.apply_unread(&self.unread);
+    }
+
+    /// Whether the previous successful frame showed the latest loaded content.
+    /// Notifications can use this before applying an incoming message.
+    pub fn is_reading_latest(&self, chat_id: &str) -> bool {
+        self.terminal_focused
+            && !self.show_help
+            && !self.search.active
+            && !self.messages.loading
+            && self.loaded_last_stamp.is_some()
+            && self.messages.rendered_latest
+            && self.current_chat_id.as_deref() == Some(chat_id)
+            && self.rendered_chat_id.as_deref() == Some(chat_id)
+    }
+
+    /// Called after terminal.draw succeeds, never merely after fetch or selection.
+    pub fn acknowledge_rendered(&mut self) -> bool {
+        let before = self
+            .current_chat_id
+            .as_deref()
+            .map(|id| self.unread.badge(id));
+        self.rendered_chat_id = self.current_chat_id.clone();
+        if let (Some(chat_id), Some(stamp)) = (&self.current_chat_id, &self.loaded_last_stamp) {
+            if self.is_reading_latest(chat_id) {
+                self.unread.acknowledge(chat_id, stamp);
+                self.sidebar.apply_unread(&self.unread);
+            }
+        }
+        let changed = before
+            != self
+                .current_chat_id
+                .as_deref()
+                .map(|id| self.unread.badge(id));
+        if let Err(error) = self.unread.save() {
+            self.set_error(format!("Unread state not saved: {error:#}"));
+            return true;
+        }
+        changed
     }
 
     /// Close the search overlay if it's open.
@@ -691,12 +805,12 @@ fn init_terminal() -> Result<(DefaultTerminal, TerminalSession)> {
 
     let terminal = ratatui::init();
     let session = TerminalSession;
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange)?;
     Ok((terminal, session))
 }
 
 fn restore_terminal() {
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
 }
 
@@ -711,6 +825,9 @@ impl Drop for TerminalSession {
 
 async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Result<()> {
     let mut app = App::new(log_buffer);
+    if let Some((tenant, user)) = configured_account() {
+        app.load_unread_account(&tenant, &user);
+    }
     let mut backend = Backend::start();
     let mut events = EventStream::new().filter(|event| match event {
         Ok(Event::Mouse(mouse)) => is_actionable(*mouse),
@@ -727,6 +844,9 @@ async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Resul
         // Drain log buffer before rendering to keep it from growing unbounded.
         app.debug_log.refresh();
         terminal.draw(|frame| app.render(frame))?;
+        if app.acknowledge_rendered() {
+            terminal.draw(|frame| app.render(frame))?;
+        }
 
         tokio::select! {
             maybe_event = events.next() => {
@@ -763,3 +883,7 @@ async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Resul
 #[cfg(test)]
 #[path = "mouse_tests.rs"]
 mod mouse_tests;
+
+#[cfg(test)]
+#[path = "unread_tests.rs"]
+mod unread_tests;

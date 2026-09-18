@@ -68,6 +68,8 @@ pub struct MessagesState {
     pub expanded_threads: Vec<bool>,
     /// Whether messages are being loaded.
     pub loading: bool,
+    /// True only when the current render exposes the end of the newest message.
+    pub rendered_latest: bool,
 }
 
 impl Default for MessagesState {
@@ -79,6 +81,7 @@ impl Default for MessagesState {
             viewport: Viewport::default(),
             selected: 0,
             loading: false,
+            rendered_latest: false,
         }
     }
 }
@@ -86,6 +89,7 @@ impl Default for MessagesState {
 impl MessagesState {
     /// Update messages from API response.
     pub fn update_messages(&mut self, header: &str, api_messages: Vec<api::MessageInfo>) {
+        self.rendered_latest = false;
         self.channel_header = header.to_string();
         self.messages = api_messages
             .into_iter()
@@ -147,6 +151,7 @@ pub fn render(
     user_name: &str,
     hits: &mut HitMap,
 ) {
+    state.rendered_latest = false;
     hits.add(area, Target::Messages);
     let border_style = if focused {
         Style::default().fg(Color::Yellow)
@@ -235,6 +240,7 @@ pub fn render(
         .viewport
         .prepare(total_lines, visible_height, start..end);
     let scroll = state.viewport.offset;
+    state.rendered_latest = scroll.saturating_add(visible_height) >= total_lines;
 
     // Use the very same line ranges as the renderer, including wrapped replies.
     // The separating blank line is deliberately not a message click target.
