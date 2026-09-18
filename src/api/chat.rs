@@ -22,6 +22,13 @@ struct Conversation {
     thread_properties: Option<ThreadProperties>,
     #[serde(rename = "lastMessage")]
     last_message: Option<NativeMessage>,
+    properties: Option<ConversationProperties>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationProperties {
+    /// Native read watermark: message ID; timestamp; service flags.
+    consumptionhorizon: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,6 +200,12 @@ pub struct ChatInfo {
     pub id: String,
     pub name: String,
     pub is_group: bool,
+    pub last_message_id: Option<String>,
+    pub last_message_sender_id: Option<String>,
+    pub last_message_type: Option<String>,
+    /// None when the native API supplies only a read watermark.
+    pub unread_count: Option<u32>,
+    pub has_unread: Option<bool>,
     pub last_message_time: Option<String>,
     pub last_message_sender: Option<String>,
     pub last_message_preview: Option<String>,
@@ -207,6 +220,25 @@ pub struct MessageInfo {
     pub timestamp: String,
     pub content: String,
     pub mentions: Vec<String>,
+}
+
+/// The native consumption horizon identifies the newest consumed message. It
+/// establishes only some unread activity, never a count of historical messages.
+fn native_has_unread(conversation: &Conversation) -> Option<bool> {
+    let horizon = conversation
+        .properties
+        .as_ref()?
+        .consumptionhorizon
+        .as_deref()?;
+    let read_id = horizon.split(';').next()?.trim().parse::<u64>().ok()?;
+    let message_id = conversation
+        .last_message
+        .as_ref()?
+        .id
+        .as_deref()?
+        .parse::<u64>()
+        .ok()?;
+    Some(message_id > read_id)
 }
 
 /// List recent chats and return structured data.
@@ -291,6 +323,14 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
             id,
             name,
             is_group,
+            last_message_id: conv.last_message.as_ref().and_then(|m| m.id.clone()),
+            last_message_sender_id: conv.last_message.as_ref().and_then(|m| m.from.clone()),
+            last_message_type: conv
+                .last_message
+                .as_ref()
+                .and_then(|m| m.messagetype.clone()),
+            unread_count: None,
+            has_unread: native_has_unread(conv),
             last_message_time: last_time,
             last_message_sender: last_sender,
             last_message_preview: last_preview,
@@ -420,5 +460,46 @@ mod live_message_tests {
             message_sort_key("2026-01-01T00:00:00Z", "9")
                 < message_sort_key("2026-01-01T00:00:00Z", "10")
         );
+    }
+}
+
+#[cfg(test)]
+mod unread_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn native_consumption_horizon_distinguishes_unread_without_counting_history() {
+        let conversation = |horizon: &str, message: &str| {
+            serde_json::from_value::<Conversation>(serde_json::json!({
+                "id": "chat", "properties": { "consumptionhorizon": horizon },
+                "lastMessage": { "id": message }
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            native_has_unread(&conversation(
+                "1726653600000;1726653600000; 1",
+                "1726653600001"
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            native_has_unread(&conversation(
+                "1726653600001;1726653600000;0",
+                "1726653600001"
+            )),
+            Some(false)
+        );
+        assert_eq!(
+            native_has_unread(&conversation("invalid", "1726653600001")),
+            None
+        );
+        assert_eq!(
+            native_has_unread(&conversation("1726653600000;0;0", "opaque")),
+            None
+        );
+        let missing: Conversation =
+            serde_json::from_value(serde_json::json!({"id":"chat"})).unwrap();
+        assert_eq!(native_has_unread(&missing), None);
     }
 }
