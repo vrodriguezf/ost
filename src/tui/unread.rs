@@ -270,7 +270,8 @@ impl UnreadState {
                 .read_horizon
                 .as_ref()
                 .is_some_and(|h| stamp.at_or_before(h));
-            if new && !own && !read && !state.seen.contains_key(&stamp.id) {
+            if new && current_user.is_some() && !own && !read && !state.seen.contains_key(&stamp.id)
+            {
                 state.pending.insert(stamp.id.clone(), stamp.clone());
             }
             remember(state, stamp.clone());
@@ -530,6 +531,14 @@ mod tests {
         state.acknowledge("chat", &MessageStamp::new("2", "2026-09-18T10:00:00Z"));
         assert_eq!(state.badge("chat").count, 1);
         state.acknowledge("chat", &MessageStamp::new("3", "2026-09-18T10:00:00Z"));
+        assert!(!state.badge("chat").any());
+    }
+
+    #[test]
+    fn history_does_not_classify_self_until_account_identity_is_known() {
+        let mut state = UnreadState::default();
+        state.observe_history("chat", &[message("1")], None);
+        state.observe_history("chat", &[message("1"), message("2")], None);
         assert!(!state.badge("chat").any());
     }
 
