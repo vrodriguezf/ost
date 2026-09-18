@@ -3,8 +3,8 @@
 use anyhow::Result;
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+        EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
 };
@@ -17,6 +17,7 @@ use super::debug_log::DebugLogState;
 use super::log_capture::LogBuffer;
 use super::messages::MessagesState;
 use super::mouse::{is_actionable, HitMap, Target, WHEEL_LINES};
+use super::notifications::{NotificationContext, NotificationPolicy, NotificationService};
 use super::search::SearchState;
 use super::sidebar::SidebarState;
 use super::ui;
@@ -48,6 +49,10 @@ pub struct App {
     pub is_online: bool,
     /// Current user name
     pub user_name: String,
+    /// Stable Graph/MRI identity, used to suppress notifications for our messages.
+    pub current_user_id: Option<String>,
+    /// Starts conservatively until a focus event or direct interaction is received.
+    pub terminal_focused: bool,
     /// Current channel name
     pub channel_name: String,
     /// Member count
@@ -77,6 +82,8 @@ pub struct App {
     pub debug_log: DebugLogState,
     /// Hit targets from the most recently rendered frame.
     pub mouse: HitMap,
+    notification_policy: NotificationPolicy,
+    notification_service: Option<NotificationService>,
 }
 
 impl App {
@@ -86,6 +93,8 @@ impl App {
             should_exit: false,
             is_online: false,
             user_name: "Loading...".to_string(),
+            current_user_id: None,
+            terminal_focused: false,
             channel_name: "".to_string(),
             member_count: 0,
             connection_state: "Connecting...".to_string(),
@@ -100,6 +109,8 @@ impl App {
             status_is_error: false,
             debug_log: DebugLogState::new(log_buffer),
             mouse: HitMap::default(),
+            notification_policy: NotificationPolicy::from_env(),
+            notification_service: None,
         }
     }
 }
@@ -126,7 +137,16 @@ impl App {
     /// Handle a crossterm event.
     pub fn handle_event(&mut self, event: Event, backend: &Backend) {
         match event {
+            Event::FocusGained => {
+                self.terminal_focused = true;
+                return;
+            }
+            Event::FocusLost => {
+                self.terminal_focused = false;
+                return;
+            }
             Event::Mouse(mouse) => {
+                self.terminal_focused = true;
                 self.handle_mouse(mouse, backend);
                 return;
             }
@@ -140,6 +160,7 @@ impl App {
             if key_event.kind != KeyEventKind::Press {
                 return;
             }
+            self.terminal_focused = true;
 
             // When help popup is visible, any key closes it.
             if self.show_help {
@@ -565,6 +586,8 @@ impl App {
     fn handle_backend_response(&mut self, response: BackendResponse, backend: &Backend) {
         self.mouse.clear();
         match response {
+            BackendResponse::IncomingMessage(message) => self.notify_incoming(&message),
+            BackendResponse::ConnectionState(_) => {}
             BackendResponse::Teams(Ok(teams)) => {
                 self.sidebar.update_teams(teams);
                 self.sidebar.loading = false;
@@ -619,6 +642,7 @@ impl App {
                 self.set_error(format!("Failed to send message: {:#}", e));
             }
             BackendResponse::UserInfo(Ok(info)) => {
+                self.current_user_id = Some(info.id);
                 self.user_name = info.display_name;
             }
             BackendResponse::UserInfo(Err(e)) => {
@@ -645,6 +669,36 @@ impl App {
                 self.is_online = false;
                 self.sidebar.loading = false;
                 self.set_error(format!("Auth: {}", msg));
+            }
+        }
+    }
+
+    /// Only live incoming events call this; fetching history never shows an alert.
+    fn notify_incoming(&mut self, message: &super::activity::IncomingMessage) {
+        let conversation_name = self
+            .sidebar
+            .chats
+            .iter()
+            .find(|chat| chat.id == message.chat_id)
+            .map(|chat| chat.name.as_str())
+            .or_else(|| {
+                self.sidebar
+                    .teams
+                    .iter()
+                    .flat_map(|team| &team.channels)
+                    .find(|channel| channel.id == message.chat_id)
+                    .map(|channel| channel.name.as_str())
+            })
+            .unwrap_or("Teams conversation");
+        let context = NotificationContext {
+            current_user_id: self.current_user_id.as_deref(),
+            current_chat_id: self.current_chat_id.as_deref(),
+            terminal_focused: self.terminal_focused,
+            conversation_name,
+        };
+        if let Some(notification) = self.notification_policy.prepare(message, context) {
+            if let Some(service) = &self.notification_service {
+                service.enqueue(notification);
             }
         }
     }
@@ -690,12 +744,12 @@ fn init_terminal() -> Result<(DefaultTerminal, TerminalSession)> {
 
     let terminal = ratatui::init();
     let session = TerminalSession;
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange)?;
     Ok((terminal, session))
 }
 
 fn restore_terminal() {
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
 }
 
@@ -710,6 +764,9 @@ impl Drop for TerminalSession {
 
 async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Result<()> {
     let mut app = App::new(log_buffer);
+    if app.notification_policy.enabled() {
+        app.notification_service = Some(NotificationService::start());
+    }
     let mut backend = Backend::start();
     let mut events = EventStream::new().filter(|event| match event {
         Ok(Event::Mouse(mouse)) => is_actionable(*mouse),
@@ -762,3 +819,89 @@ async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Resul
 #[cfg(test)]
 #[path = "mouse_tests.rs"]
 mod mouse_tests;
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    use crate::api;
+    use crate::tui::activity::IncomingMessage;
+    use crate::tui::sidebar::Chat;
+
+    #[test]
+    fn only_live_events_enqueue_alerts_and_focus_changes_take_effect() {
+        let mut app = App::new(LogBuffer::new());
+        app.notification_policy = NotificationPolicy::new(true);
+        let (service, mut captured) = NotificationService::for_test();
+        app.notification_service = Some(service);
+        let (backend, _) = Backend::for_test();
+        app.handle_backend_response(
+            BackendResponse::UserInfo(Ok(api::UserInfo {
+                id: "me".into(),
+                display_name: "Me".into(),
+                mail: None,
+            })),
+            &backend,
+        );
+        app.current_chat_id = Some("chat".into());
+        app.sidebar.chats.push(Chat {
+            id: "chat".into(),
+            name: "Research".into(),
+            is_group: true,
+            unread: 0,
+            online: false,
+        });
+        let message = IncomingMessage {
+            chat_id: "chat".into(),
+            id: "new".into(),
+            sender_id: "https://example.test/contacts/8:orgid:other".into(),
+            sender: "Alice".into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: "Hello".into(),
+            mentions: Vec::new(),
+        };
+        app.handle_backend_response(
+            BackendResponse::Messages {
+                chat_id: "chat".into(),
+                result: Ok(vec![api::MessageInfo {
+                    id: message.id.clone(),
+                    sender_id: message.sender_id.clone(),
+                    sender: message.sender.clone(),
+                    timestamp: message.timestamp.clone(),
+                    content: message.content.clone(),
+                    mentions: vec!["me".into()],
+                }]),
+            },
+            &backend,
+        );
+        assert!(captured.try_recv().is_err(), "history cannot show alerts");
+        app.handle_event(Event::FocusGained, &backend);
+        app.handle_backend_response(BackendResponse::IncomingMessage(message.clone()), &backend);
+        assert!(
+            captured.try_recv().is_err(),
+            "foreground non-mention is quiet"
+        );
+        app.handle_event(Event::FocusLost, &backend);
+        app.handle_backend_response(BackendResponse::IncomingMessage(message.clone()), &backend);
+        assert!(
+            captured.try_recv().is_err(),
+            "focus loss cannot replay messages"
+        );
+        let mut next = message.clone();
+        next.id = "next".into();
+        app.handle_backend_response(BackendResponse::IncomingMessage(next), &backend);
+        let queued = captured.try_recv().unwrap();
+        assert_eq!(queued.notification.summary, "Alice — Research");
+        assert_eq!(queued.notification.body, "Hello");
+        app.handle_event(Event::FocusGained, &backend);
+        let mut mention = message;
+        mention.id = "mention".into();
+        mention.mentions = vec!["8:orgid:me".into()];
+        app.handle_backend_response(BackendResponse::IncomingMessage(mention), &backend);
+        assert!(captured
+            .try_recv()
+            .unwrap()
+            .notification
+            .summary
+            .contains("mentioned you"));
+    }
+}

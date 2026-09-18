@@ -2,6 +2,7 @@
 //!
 //! Terminal user interface using Ratatui.
 
+mod activity;
 mod app;
 mod backend;
 mod compose;
@@ -10,6 +11,7 @@ mod help;
 mod log_capture;
 mod messages;
 mod mouse;
+mod notifications;
 mod search;
 mod sidebar;
 mod text_input;
