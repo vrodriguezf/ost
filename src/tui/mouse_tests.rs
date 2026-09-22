@@ -679,6 +679,7 @@ fn background_history_preserves_wheel_anchor_and_follows_latest_when_selected() 
     assert_eq!(row_text(h.terminal.backend().buffer(), 3), first_visible);
     h.app.messages.selected = h.app.messages.messages.len() - 1;
     h.app.messages.viewport.follow_selection = true;
+    h.draw();
     h.app
         .messages
         .update_messages("Chat", vec![live_message(31, "latest message")]);
@@ -779,4 +780,187 @@ fn empty_sidebar_navigation_keeps_teams_parent_selectable() {
     assert!(h.app.sidebar.teams_expanded);
     h.key(KeyCode::Up);
     assert_eq!(h.app.sidebar.selected, 0);
+}
+
+fn live_history(h: &mut Harness, chat_id: &str, messages: Vec<api::MessageInfo>) {
+    h.app.handle_backend_response(
+        BackendResponse::Messages {
+            chat_id: chat_id.into(),
+            result: Ok(messages),
+        },
+        &h.backend,
+    );
+}
+
+fn chat_with_history() -> Harness {
+    let mut h = Harness::new();
+    h.app.current_chat_id = Some("chat".into());
+    live_history(
+        &mut h,
+        "chat",
+        (1..30)
+            .map(|i| live_message(i, &format!("Message {i}")))
+            .collect(),
+    );
+    h.draw();
+    h
+}
+
+#[test]
+fn successful_send_reveals_latest_without_leaving_compose_even_after_stale_refresh() {
+    let mut h = chat_with_history();
+    h.mouse(MouseEventKind::ScrollUp, 35, 8);
+    assert!(!h.app.messages.rendered_latest);
+    h.click_text("Type a message");
+    h.app.compose.input = "outgoing reply".into();
+    h.key(KeyCode::Enter);
+    assert!(matches!(
+        h.commands.try_recv().unwrap(),
+        BackendCommand::SendMessage { chat_id, message }
+            if chat_id == "chat" && message == "outgoing reply"
+    ));
+    h.app.compose.input = "next draft".into();
+    h.app.handle_backend_response(
+        BackendResponse::MessageSent {
+            chat_id: "chat".into(),
+            result: Ok(()),
+        },
+        &h.backend,
+    );
+    assert_eq!(h.loaded_chat(), "chat");
+    // An already queued history response may precede visibility of our send.
+    live_history(&mut h, "chat", vec![live_message(29, "Message 29")]);
+    h.draw();
+    assert!(h.app.messages.rendered_latest);
+    let content = format!(
+        "{}\nEND OF SENT MESSAGE",
+        "wrapped outgoing body ".repeat(300)
+    );
+    live_history(&mut h, "chat", vec![live_message(30, &content)]);
+    h.draw();
+    h.text_position("END OF SENT MESSAGE");
+    assert!(h.app.messages.rendered_latest);
+    assert_eq!(h.app.messages.messages[h.app.messages.selected].id, "30");
+    assert_eq!(h.app.active_pane, Pane::Compose);
+    assert_eq!(h.app.compose.input, "next draft");
+    // Following the bottom must survive subsequent draws of a tall message.
+    h.draw();
+    h.text_position("END OF SENT MESSAGE");
+    h.mouse(MouseEventKind::ScrollUp, 35, 8);
+    let offset = h.app.messages.viewport.offset;
+    live_history(&mut h, "chat", vec![live_message(31, "later reply")]);
+    h.draw();
+    assert_eq!(h.app.messages.viewport.offset, offset);
+    assert!(!h.app.messages.rendered_latest);
+}
+
+#[test]
+fn incoming_messages_follow_mouse_return_to_bottom_and_tall_queued_updates() {
+    let mut h = chat_with_history();
+    h.mouse(MouseEventKind::ScrollUp, 35, 8);
+    h.mouse(MouseEventKind::ScrollUp, 35, 8);
+    h.mouse(MouseEventKind::ScrollDown, 35, 8);
+    h.mouse(MouseEventKind::ScrollDown, 35, 8);
+    assert!(h.app.messages.rendered_latest);
+    assert!(!h.app.messages.viewport.follow_selection);
+    h.click_text("Type a message");
+    h.app.compose.input = "draft remains".into();
+    let content = format!(
+        "{}\nEND OF INCOMING MESSAGE",
+        "wrapped incoming body ".repeat(300)
+    );
+    live_history(&mut h, "chat", vec![live_message(30, &content)]);
+    live_history(&mut h, "chat", vec![live_message(30, &content)]);
+    h.draw();
+    h.text_position("END OF INCOMING MESSAGE");
+    assert!(h.app.messages.rendered_latest);
+    h.draw();
+    assert!(h.app.messages.rendered_latest);
+    assert_eq!(h.app.active_pane, Pane::Compose);
+    assert_eq!(h.app.compose.input, "draft remains");
+}
+
+#[test]
+fn incoming_messages_preserve_scrolled_history_and_compose_draft() {
+    let mut h = chat_with_history();
+    h.mouse(MouseEventKind::ScrollUp, 35, 8);
+    h.click_text("Type a message");
+    h.app.compose.input = "unfinished".into();
+    let offset = h.app.messages.viewport.offset;
+    let first_visible = row_text(h.terminal.backend().buffer(), 3);
+    live_history(&mut h, "chat", vec![live_message(30, "new arrival")]);
+    h.draw();
+    assert_eq!(h.app.messages.viewport.offset, offset);
+    assert_eq!(row_text(h.terminal.backend().buffer(), 3), first_visible);
+    assert!(!h.app.messages.rendered_latest);
+    assert_eq!(h.app.active_pane, Pane::Compose);
+    assert_eq!(h.app.compose.input, "unfinished");
+}
+
+#[test]
+fn failed_send_preserves_viewport_and_does_not_refresh() {
+    let mut h = chat_with_history();
+    h.mouse(MouseEventKind::ScrollUp, 35, 8);
+    h.click_text("Type a message");
+    let offset = h.app.messages.viewport.offset;
+    h.app.handle_backend_response(
+        BackendResponse::MessageSent {
+            chat_id: "chat".into(),
+            result: Err(anyhow::anyhow!("offline")),
+        },
+        &h.backend,
+    );
+    h.draw();
+    assert!(h.app.status_is_error);
+    assert_eq!(h.app.messages.viewport.offset, offset);
+    assert!(!h.app.messages.rendered_latest);
+    assert_eq!(h.app.active_pane, Pane::Compose);
+    assert!(h.commands.try_recv().is_err());
+}
+
+#[test]
+fn completion_after_switching_chats_does_not_scroll_or_reload_the_active_chat() {
+    let mut h = chat_with_history();
+    h.add_chats(2);
+    h.draw();
+    h.click_text("Chat 01");
+    assert_eq!(h.loaded_chat(), "chat-1");
+    live_history(
+        &mut h,
+        "chat-1",
+        (1..30)
+            .map(|i| live_message(i, &format!("Other {i}")))
+            .collect(),
+    );
+    h.draw();
+    h.mouse(MouseEventKind::ScrollUp, 35, 8);
+    h.click_text("Type a message");
+    h.app.compose.input = "other conversation draft".into();
+    let offset = h.app.messages.viewport.offset;
+    h.app.handle_backend_response(
+        BackendResponse::MessageSent {
+            chat_id: "chat".into(),
+            result: Ok(()),
+        },
+        &h.backend,
+    );
+    live_history(&mut h, "chat", vec![live_message(30, "old chat send")]);
+    h.draw();
+    assert_eq!(h.app.messages.viewport.offset, offset);
+    assert!(!h.app.messages.rendered_latest);
+    assert_eq!(h.app.current_chat_id.as_deref(), Some("chat-1"));
+    assert_eq!(h.app.active_pane, Pane::Compose);
+    assert_eq!(h.app.compose.input, "other conversation draft");
+    assert!(h.commands.try_recv().is_err());
+}
+
+#[test]
+fn history_updates_before_first_render_keep_the_latest_message_selected() {
+    let mut h = Harness::new();
+    h.app.current_chat_id = Some("chat".into());
+    live_history(&mut h, "chat", vec![live_message(1, "first")]);
+    live_history(&mut h, "chat", vec![live_message(2, "latest")]);
+    h.draw();
+    assert_eq!(h.app.messages.messages[h.app.messages.selected].id, "2");
+    h.text_position("latest");
 }

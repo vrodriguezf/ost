@@ -291,6 +291,7 @@ impl App {
                             }
                             self.messages.selected = idx;
                             self.messages.viewport.follow_selection = false;
+                            self.messages.viewport.follow_bottom = false;
                         }
                         self.active_pane = Pane::Messages;
                     }
@@ -431,6 +432,7 @@ impl App {
                     self.messages.loading = true;
                     self.messages.channel_header = name;
                     self.messages.messages.clear();
+                    self.messages.viewport = Default::default();
                     backend.send(BackendCommand::LoadMessages {
                         chat_id: id,
                         limit: 50,
@@ -624,6 +626,7 @@ impl App {
                 if msg_idx < self.messages.messages.len() {
                     self.messages.selected = msg_idx;
                     self.messages.viewport.follow_selection = true;
+                    self.messages.viewport.follow_bottom = false;
                 }
                 self.active_pane = Pane::Messages;
             }
@@ -718,18 +721,19 @@ impl App {
                     }
                 }
             }
-            BackendResponse::MessageSent(Ok(())) => {
+            BackendResponse::MessageSent {
+                chat_id,
+                result: Ok(()),
+            } => {
                 self.status_message = Some("Message sent".to_string());
                 self.status_is_error = false;
-                // Reload messages for the current chat.
-                if let Some(ref chat_id) = self.current_chat_id {
-                    backend.send(BackendCommand::LoadMessages {
-                        chat_id: chat_id.clone(),
-                        limit: 50,
-                    });
+                // A completion from a previous conversation must not move this one.
+                if self.current_chat_id.as_deref() == Some(&chat_id) {
+                    self.messages.reveal_latest();
+                    backend.send(BackendCommand::LoadMessages { chat_id, limit: 50 });
                 }
             }
-            BackendResponse::MessageSent(Err(e)) => {
+            BackendResponse::MessageSent { result: Err(e), .. } => {
                 self.set_error(format!("Failed to send message: {:#}", e));
             }
             BackendResponse::UserInfo(Ok(info)) => {

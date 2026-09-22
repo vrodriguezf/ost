@@ -99,8 +99,12 @@ impl MessagesState {
     /// Background updates keep the reading anchor and selected message intact.
     pub fn update_messages(&mut self, header: &str, api_messages: Vec<api::MessageInfo>) {
         let initial = self.loading || self.channel_header != header || self.messages.is_empty();
+        let following_bottom = self.viewport.follow_bottom;
         let follow_latest = initial
-            || (self.viewport.follow_selection
+            || following_bottom
+            || self.viewport.is_at_bottom()
+            || (self.scroll_anchor.is_none()
+                && self.viewport.follow_selection
                 && self.selected == self.messages.len().saturating_sub(1));
         let selected_id = self
             .messages
@@ -160,12 +164,22 @@ impl MessagesState {
                 .and_then(|id| self.messages.iter().position(|message| message.id == id))
                 .unwrap_or(self.selected.min(self.messages.len().saturating_sub(1)))
         };
-        self.restore_anchor = !initial && !self.viewport.follow_selection;
+        self.viewport.follow_bottom = following_bottom || (!initial && follow_latest);
+        self.restore_anchor = !initial && !follow_latest && !self.viewport.follow_selection;
         self.loading = false;
+    }
+
+    /// Reveal the end of this conversation and keep following until navigation.
+    pub fn reveal_latest(&mut self) {
+        self.selected = self.messages.len().saturating_sub(1);
+        self.viewport.follow_bottom = true;
+        self.viewport.follow_selection = false;
+        self.restore_anchor = false;
     }
 
     /// Move selection up by one message.
     pub fn select_previous(&mut self) {
+        self.viewport.follow_bottom = false;
         self.viewport.follow_selection = true;
         if self.selected > 0 {
             self.selected -= 1;
@@ -174,6 +188,7 @@ impl MessagesState {
 
     /// Move selection down by one message.
     pub fn select_next(&mut self) {
+        self.viewport.follow_bottom = false;
         self.viewport.follow_selection = true;
         if self.selected + 1 < self.messages.len() {
             self.selected += 1;

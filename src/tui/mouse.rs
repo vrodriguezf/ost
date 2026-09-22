@@ -63,6 +63,8 @@ impl HitMap {
 pub struct Viewport {
     pub offset: usize,
     pub follow_selection: bool,
+    /// Follow the final rendered line, including messages taller than the pane.
+    pub follow_bottom: bool,
     height: usize,
     total: usize,
 }
@@ -72,6 +74,7 @@ impl Default for Viewport {
         Self {
             offset: 0,
             follow_selection: true,
+            follow_bottom: false,
             height: 0,
             total: 0,
         }
@@ -82,7 +85,9 @@ impl Viewport {
     pub fn prepare(&mut self, total: usize, height: usize, selected: Range<usize>) {
         self.total = total;
         self.height = height;
-        if self.follow_selection && height > 0 {
+        if self.follow_bottom {
+            self.offset = total.saturating_sub(height);
+        } else if self.follow_selection && height > 0 {
             if selected.start < self.offset || selected.len() >= height {
                 self.offset = selected.start;
             } else if selected.end > self.offset.saturating_add(height) {
@@ -94,6 +99,7 @@ impl Viewport {
 
     pub fn scroll(&mut self, up: bool) {
         self.follow_selection = false;
+        self.follow_bottom = false;
         self.offset = if up {
             self.offset.saturating_sub(WHEEL_LINES)
         } else {
@@ -101,5 +107,9 @@ impl Viewport {
                 .saturating_add(WHEEL_LINES)
                 .min(self.total.saturating_sub(self.height))
         };
+    }
+
+    pub fn is_at_bottom(&self) -> bool {
+        self.height > 0 && self.offset >= self.total.saturating_sub(self.height)
     }
 }

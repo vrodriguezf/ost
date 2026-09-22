@@ -33,7 +33,10 @@ pub enum BackendResponse {
         chat_id: String,
         result: Result<Vec<api::MessageInfo>>,
     },
-    MessageSent(Result<()>),
+    MessageSent {
+        chat_id: String,
+        result: Result<()>,
+    },
     UserInfo(Result<api::UserInfo>),
     Presence(Result<api::PresenceInfo>),
     ClientError(String),
@@ -369,7 +372,11 @@ async fn backend_loop(
                     }
                     BackendCommand::SendMessage { chat_id, message } => {
                         let result = api::send_message_with_client(&client, &chat_id, &message).await;
-                        let _ = resp_tx.send(BackendResponse::MessageSent(result));
+                        if result.is_ok() {
+                            // Reconcile the originating chat without changing the active subscription.
+                            pending.insert(chat_id.clone());
+                        }
+                        let _ = resp_tx.send(BackendResponse::MessageSent { chat_id, result });
                         chats_due = true;
                     }
                     BackendCommand::LoadUserInfo => { let _ = resp_tx.send(BackendResponse::UserInfo(api::whoami_data(&client).await)); }

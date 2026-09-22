@@ -112,8 +112,9 @@ conversation and recent-chat list without input, and checks for missed updates
 every 30 seconds. Each reconciliation reads up to 50 recent conversations and 50
 messages per affected conversation; very large backlogs may need opening in Teams.
 Draft text, the selected conversation, search, and your reading position survive
-background refreshes. The view follows new messages when already at the latest
-message; scrolling back keeps your place.
+background refreshes. The view follows new messages when already at the bottom,
+including after scrolling back down with the mouse; scrolling up keeps your place.
+A successful send reveals the latest messages while keeping focus in compose.
 
 The header reports **Live** only after push registration succeeds. **Reconnecting**
 shows the retry delay while periodic checks continue; **Degraded** reports a push,
