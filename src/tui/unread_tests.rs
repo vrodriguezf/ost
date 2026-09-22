@@ -171,6 +171,7 @@ fn sidebar_reorder_preserves_identity_badges_collapsed_teams_and_selection() {
         }]
     };
     app.sidebar.update_teams(teams());
+    app.sidebar.teams_expanded = true;
     app.sidebar.teams[0].expanded = false;
     app.sidebar
         .update_chats(vec![chat("other"), chat("chat")], Some("self"));

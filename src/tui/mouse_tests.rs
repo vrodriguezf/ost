@@ -153,6 +153,7 @@ fn sidebar_clicks_expand_teams_and_open_channels_and_chats() {
     h.add_team();
     h.add_chats(2);
     h.draw();
+    h.click_text("TEAMS");
     h.click_text("Team One");
     assert!(!h.app.sidebar.teams[0].expanded);
     assert!(h.commands.try_recv().is_err());
@@ -376,6 +377,7 @@ fn search_scroll_and_click_open_the_visible_result_and_block_underlying_panes() 
 fn search_keyboard_enter_and_message_results_use_existing_navigation() {
     let mut h = Harness::new();
     h.add_team();
+    h.app.sidebar.teams[0].expanded = false;
     h.add_messages(30);
     h.draw();
     h.app.search.activate();
@@ -384,6 +386,8 @@ fn search_keyboard_enter_and_message_results_use_existing_navigation() {
     h.draw();
     h.key(KeyCode::Enter);
     assert_eq!(h.loaded_chat(), "channel-1");
+    assert!(h.app.sidebar.teams_expanded);
+    h.text_position("Channel One");
     h.add_messages(30);
     h.app.messages.loading = false;
     h.app.search.activate();
@@ -702,4 +706,77 @@ fn presence_never_claims_that_the_push_connection_is_healthy() {
     );
     assert!(h.app.is_online);
     assert_eq!(h.app.connection_state, "Live");
+}
+
+#[test]
+fn teams_parent_defaults_closed_and_toggles_with_mouse_and_keyboard() {
+    let mut h = Harness::new();
+    h.add_team();
+    h.add_chats(2);
+    h.draw();
+    assert!(!h.app.sidebar.teams_expanded);
+    assert_eq!(h.app.sidebar.item_count(), 4);
+    h.text_position("▶ TEAMS");
+    h.click_text("Chat 00");
+    assert_eq!(h.loaded_chat(), "chat-0");
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.sidebar.selected, 0);
+    h.key(KeyCode::Enter);
+    h.text_position("▼ TEAMS");
+    h.text_position("Channel One");
+    h.click_text("Team One");
+    assert!(!h.app.sidebar.teams[0].expanded);
+    h.click_text("TEAMS");
+    assert_eq!(h.app.sidebar.item_count(), 4);
+    h.key(KeyCode::Enter);
+    assert!(!h.app.sidebar.teams[0].expanded);
+    h.text_position("Team One");
+    h.key(KeyCode::Enter);
+    h.key(KeyCode::Down);
+    assert_eq!(h.app.sidebar.selected_item_id().as_deref(), Some("chat-0"));
+    h.key(KeyCode::Enter);
+    assert_eq!(h.loaded_chat(), "chat-0");
+}
+
+#[test]
+fn teams_parent_refresh_preserves_state_and_chat_identity() {
+    let mut h = Harness::new();
+    h.add_team();
+    h.add_chats(2);
+    let teams = || {
+        vec![api::TeamInfo {
+            id: "team-1".into(),
+            name: "Team One".into(),
+            channels: vec![api::ChannelInfo {
+                id: "channel-1".into(),
+                name: "Channel One".into(),
+            }],
+        }]
+    };
+    h.draw();
+    h.click_text("Chat 01");
+    h.loaded_chat();
+    h.app.sidebar.update_teams(teams());
+    assert!(!h.app.sidebar.teams_expanded);
+    assert_eq!(h.app.sidebar.selected_item_id().as_deref(), Some("chat-1"));
+    h.click_text("TEAMS");
+    h.app.sidebar.update_teams(teams());
+    assert!(h.app.sidebar.teams_expanded);
+    assert_eq!(h.app.sidebar.selected, 0);
+    h.draw();
+    h.click_text("TEAMS");
+    h.click_text("Chat 00");
+    assert_eq!(h.loaded_chat(), "chat-0");
+}
+
+#[test]
+fn empty_sidebar_navigation_keeps_teams_parent_selectable() {
+    let mut h = Harness::new();
+    h.draw();
+    h.key(KeyCode::Down);
+    assert_eq!(h.app.sidebar.selected, 0);
+    h.key(KeyCode::Enter);
+    assert!(h.app.sidebar.teams_expanded);
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.sidebar.selected, 0);
 }

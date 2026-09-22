@@ -59,6 +59,12 @@ fn setup() -> (App, Backend, Receiver<QueuedNotification>) {
         BackendResponse::Chats(Ok(vec![chat("active"), chat("background")])),
         &backend,
     );
+    app.sidebar.selected = app
+        .sidebar
+        .flat_items()
+        .iter()
+        .position(|item| matches!(item, super::super::sidebar::SidebarItem::Chat(0)))
+        .unwrap();
     app.current_chat_id = Some("active".into());
     app.messages.channel_header = "Conversation active".into();
     (app, backend, capture)

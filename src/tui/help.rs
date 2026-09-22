@@ -137,7 +137,7 @@ const MESSAGING: Category = Category {
     shortcuts: &[
         Shortcut {
             key: "Enter",
-            desc: "Send message / Open thread",
+            desc: "Send / Open / Toggle team",
         },
         Shortcut {
             key: "Ctrl+Enter",

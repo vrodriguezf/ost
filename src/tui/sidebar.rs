@@ -55,6 +55,8 @@ pub struct Chat {
 /// Sidebar state: owns the data and tracks navigation.
 pub struct SidebarState {
     pub teams: Vec<Team>,
+    /// Whether the Teams parent reveals its hierarchy during this session.
+    pub teams_expanded: bool,
     pub chats: Vec<Chat>,
     /// Index into the flat item list (0-based)
     pub selected: usize,
@@ -67,6 +69,7 @@ impl Default for SidebarState {
     fn default() -> Self {
         Self {
             teams: Vec::new(),
+            teams_expanded: false,
             chats: Vec::new(),
             selected: 0,
             viewport: Viewport::default(),
@@ -242,7 +245,7 @@ impl SidebarState {
 /// One row in the sidebar's flat list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarItem {
-    /// "TEAMS" section header (not selectable, but occupies a row)
+    /// Selectable "TEAMS" parent toggle
     TeamsHeader,
     /// A team row (index into SidebarState.teams)
     Team(usize),
@@ -262,11 +265,13 @@ impl SidebarState {
         // Teams header
         items.push(SidebarItem::TeamsHeader);
 
-        for (ti, team) in self.teams.iter().enumerate() {
-            items.push(SidebarItem::Team(ti));
-            if team.expanded {
-                for (ci, _ch) in team.channels.iter().enumerate() {
-                    items.push(SidebarItem::Channel(ti, ci));
+        if self.teams_expanded {
+            for (ti, team) in self.teams.iter().enumerate() {
+                items.push(SidebarItem::Team(ti));
+                if team.expanded {
+                    for (ci, _ch) in team.channels.iter().enumerate() {
+                        items.push(SidebarItem::Channel(ti, ci));
+                    }
                 }
             }
         }
@@ -304,16 +309,21 @@ impl SidebarState {
         }
         if self.selected < count - 1 {
             self.selected += 1;
-            self.skip_headers_down();
+            self.clamp_selection();
         }
     }
 
-    /// Toggle expand/collapse if current selection is a Team row.
+    /// Toggle the Teams parent or an individual team.
     pub fn toggle_expand(&mut self) {
         let items = self.flat_items();
-        if let Some(SidebarItem::Team(ti)) = items.get(self.selected) {
-            self.teams[*ti].expanded = !self.teams[*ti].expanded;
+        match items.get(self.selected) {
+            Some(SidebarItem::TeamsHeader) => self.teams_expanded = !self.teams_expanded,
+            Some(SidebarItem::Team(ti)) => {
+                self.teams[*ti].expanded = !self.teams[*ti].expanded;
+            }
+            _ => return,
         }
+        self.viewport.follow_selection = true;
     }
 
     /// Skip non-selectable headers when moving up.
@@ -321,15 +331,14 @@ impl SidebarState {
         let items = self.flat_items();
         while self.selected > 0 {
             match items.get(self.selected) {
-                Some(SidebarItem::TeamsHeader | SidebarItem::ChatsHeader) => {
+                Some(SidebarItem::ChatsHeader) => {
                     self.selected -= 1;
                 }
                 _ => break,
             }
         }
-        // If we landed on TeamsHeader (index 0), move down instead
-        if let Some(SidebarItem::TeamsHeader | SidebarItem::ChatsHeader) = items.get(self.selected)
-        {
+        // If no selectable row was found, move down instead
+        if let Some(SidebarItem::ChatsHeader) = items.get(self.selected) {
             self.skip_headers_down();
         }
     }
@@ -340,7 +349,7 @@ impl SidebarState {
         let count = items.len();
         while self.selected < count - 1 {
             match items.get(self.selected) {
-                Some(SidebarItem::TeamsHeader | SidebarItem::ChatsHeader) => {
+                Some(SidebarItem::ChatsHeader) => {
                     self.selected += 1;
                 }
                 _ => break,
@@ -360,6 +369,12 @@ impl SidebarState {
         }
         // After clamping, skip headers
         self.skip_headers_down();
+        if matches!(
+            self.flat_items().get(self.selected),
+            Some(SidebarItem::ChatsHeader)
+        ) {
+            self.skip_headers_up();
+        }
     }
 }
 
@@ -437,7 +452,7 @@ pub fn render(
         };
 
         render_item(buf, &ctx, item, state);
-        if !matches!(item, SidebarItem::TeamsHeader | SidebarItem::ChatsHeader) {
+        if !matches!(item, SidebarItem::ChatsHeader) {
             hits.add(ctx.area, Target::SidebarItem(item_idx));
         }
     }
@@ -485,12 +500,12 @@ fn render_item(buf: &mut Buffer, ctx: &RowCtx, item: &SidebarItem, state: &Sideb
     let w = ctx.area.width as usize;
     match item {
         SidebarItem::TeamsHeader => {
-            let label = if ctx.pane_focused {
-                ">> TEAMS"
+            let label = if state.teams_expanded {
+                "▼ TEAMS"
             } else {
-                "   TEAMS"
+                "▶ TEAMS"
             };
-            let style = Style::default()
+            let style = item_style(ctx.selected && ctx.pane_focused, false)
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD);
             render_row(buf, ctx.area, label, "", style, style);
