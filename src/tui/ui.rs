@@ -86,6 +86,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         &mut app.messages,
         app.active_pane == Pane::Messages,
         &app.user_name,
+        app.current_user_id.as_deref(),
         &mut app.mouse,
     );
 
