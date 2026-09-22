@@ -91,6 +91,7 @@ teams-cli tui
 
 Mouse controls are enabled automatically:
 
+- **Teams starts collapsed**, keeping Chats visible. Click **TEAMS**, or select it with the arrow keys and press **Enter**, to fold or unfold the entire hierarchy. This choice lasts for the session; individual team expansion states are preserved. Opening a channel from search reveals its parent automatically.
 - **Click** a team to expand or collapse it, or a channel/chat to open it.
 - **Wheel** scrolls the sidebar, messages, search results, or debug log under the pointer, three lines at a time.
 - **Click a message** to select it; click the selected message again to toggle its loaded thread replies.

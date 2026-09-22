@@ -416,7 +416,7 @@ impl App {
         };
 
         match item {
-            super::sidebar::SidebarItem::Team(_) => {
+            super::sidebar::SidebarItem::TeamsHeader | super::sidebar::SidebarItem::Team(_) => {
                 self.sidebar.toggle_expand();
                 self.sidebar.clamp_selection();
             }
@@ -585,7 +585,8 @@ impl App {
 
         match result {
             SearchResultKind::Channel(team_idx, channel_idx) => {
-                // Expand the team if collapsed, then select the channel in sidebar.
+                // Reveal both ancestors before selecting the channel.
+                self.sidebar.teams_expanded = true;
                 if !self.sidebar.teams[team_idx].expanded {
                     self.sidebar.teams[team_idx].expanded = true;
                 }
@@ -656,8 +657,7 @@ impl App {
                 self.sidebar.update_teams(teams);
                 self.sidebar.apply_unread(&self.unread);
                 self.sidebar.loading = false;
-                // If this is the first data load and we have teams, select the first
-                // selectable item (skip TeamsHeader).
+                // Keep selection valid after the hierarchy changes.
                 if self.sidebar.selected == 0 {
                     self.sidebar.clamp_selection();
                 }
