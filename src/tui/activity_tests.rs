@@ -72,6 +72,74 @@ fn draw(app: &mut App, terminal: &mut Terminal<TestBackend>) {
 }
 
 #[test]
+fn own_message_rendering_recovers_after_delayed_identity_and_history_refresh() {
+    let (mut app, backend, _) = setup();
+    app.current_user_id = None;
+    app.user_name = "Loading...".into();
+    let mut own = message("active", "1");
+    own.sender_id = "https://chat/contacts/8:orgid:ME".into();
+    own.sender.clear();
+    own.content = "Unique reply body".into();
+    app.handle_backend_response(
+        BackendResponse::Messages {
+            chat_id: "active".into(),
+            result: Ok(vec![history(&own)]),
+        },
+        &backend,
+    );
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    let body_position = |terminal: &Terminal<TestBackend>| {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .find_map(|y| {
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                row.find("Unique reply body").map(|x| (x, y))
+            })
+            .expect("reply body is visible")
+    };
+    draw(&mut app, &mut terminal);
+    let before = body_position(&terminal);
+    app.handle_backend_response(
+        BackendResponse::UserInfo(Ok(crate::api::UserInfo {
+            id: "me".into(),
+            display_name: "My Name".into(),
+            mail: None,
+        })),
+        &backend,
+    );
+    draw(&mut app, &mut terminal);
+    let after = body_position(&terminal);
+    assert!(
+        after.0 > before.0,
+        "own message should now be right-aligned"
+    );
+    let buffer = terminal.backend().buffer();
+    let header: String = (0..buffer.area.width)
+        .map(|x| buffer[(x, after.1 - 1)].symbol())
+        .collect();
+    assert!(header.contains("My Name"));
+    let rendered = buffer.clone();
+    let selected = app.messages.selected;
+    let offset = app.messages.viewport.offset;
+
+    // The native history can continue to omit the display name after sending.
+    own.sender = "?".into();
+    app.handle_backend_response(
+        BackendResponse::Messages {
+            chat_id: "active".into(),
+            result: Ok(vec![history(&own)]),
+        },
+        &backend,
+    );
+    draw(&mut app, &mut terminal);
+    assert_eq!(*terminal.backend().buffer(), rendered);
+    assert_eq!(app.messages.selected, selected);
+    assert_eq!(app.messages.viewport.offset, offset);
+}
+
+#[test]
 fn chat_refresh_after_a_reply_never_replaces_a_known_name_with_an_id() {
     let (mut app, backend, _) = setup();
     let mut named = chat("active");

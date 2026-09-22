@@ -202,6 +202,7 @@ pub fn render(
     state: &mut MessagesState,
     focused: bool,
     user_name: &str,
+    current_user_id: Option<&str>,
     hits: &mut HitMap,
 ) {
     state.rendered_latest = false;
@@ -279,8 +280,12 @@ pub fn render(
     }
 
     // Pre-render all messages into a line buffer (single pass produces lines + ranges).
-    let (all_lines, msg_line_ranges) =
-        build_message_lines(state, messages_area.width as usize, user_name);
+    let (all_lines, msg_line_ranges) = build_message_lines(
+        state,
+        messages_area.width as usize,
+        user_name,
+        current_user_id,
+    );
     let total_lines = all_lines.len();
     let visible_height = messages_area.height as usize;
 
@@ -382,6 +387,7 @@ fn build_message_lines(
     state: &MessagesState,
     width: usize,
     user_name: &str,
+    current_user_id: Option<&str>,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let today = Local::now().naive_local().date();
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -407,13 +413,23 @@ fn build_message_lines(
             msg_idx,
             today,
             user_name,
+            current_user_id,
         );
 
         // Render thread replies if expanded.
         if thread_expanded && !msg.replies.is_empty() {
             for reply in &msg.replies {
                 render_message_card(
-                    &mut lines, reply, width, false, true, 4, msg_idx, today, user_name,
+                    &mut lines,
+                    reply,
+                    width,
+                    false,
+                    true,
+                    4,
+                    msg_idx,
+                    today,
+                    user_name,
+                    current_user_id,
                 );
             }
         } else if msg.reply_count > 0 && !thread_expanded {
@@ -451,8 +467,19 @@ fn render_message_card(
     msg_idx: usize,
     today: NaiveDate,
     user_name: &str,
+    current_user_id: Option<&str>,
 ) {
-    let is_own = msg.sender == user_name;
+    let is_own = current_user_id.is_some_and(|user| super::unread::same_user(user, &msg.sender_id));
+    // Native messages sent by the CLI may omit imdisplayname. Resolve the
+    // label at render time so identity arriving after history also repairs it.
+    let sender = if is_own && matches!(msg.sender.trim(), "" | "?" | "[unknown]") {
+        match user_name.trim() {
+            "" | "Loading..." => "You",
+            name => name,
+        }
+    } else {
+        &msg.sender
+    };
     let indent_str: String = " ".repeat(indent);
     let reply_prefix = if is_reply { " -> " } else { "" };
 
@@ -491,7 +518,7 @@ fn render_message_card(
 
     let selection_indicator = if is_selected && !is_reply { "> " } else { "  " };
 
-    let sender_color = username_to_color(&msg.sender);
+    let sender_color = username_to_color(sender);
     let sender_style = Style::default()
         .fg(sender_color)
         .bg(bg)
@@ -519,13 +546,13 @@ fn render_message_card(
     // Sender + timestamp line.
     let prefix = format!("{}{}{}", indent_str, reply_prefix, selection_indicator);
     let ts_gap = content_width
-        .saturating_sub(msg.sender.len())
+        .saturating_sub(sender.len())
         .saturating_sub(formatted_ts.len());
-    let used = prefix.len() + msg.sender.len() + ts_gap + formatted_ts.len();
+    let used = prefix.len() + sender.len() + ts_gap + formatted_ts.len();
     lines.push(make_bg_line(
         vec![
             Span::styled(prefix.clone(), bg_style),
-            Span::styled(msg.sender.clone(), sender_style),
+            Span::styled(sender.to_owned(), sender_style),
             Span::styled(" ".repeat(ts_gap), bg_style),
             Span::styled(formatted_ts, timestamp_style),
         ],
@@ -744,4 +771,62 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color {
         ((g1 + m) * 255.0) as u8,
         ((b1 + m) * 255.0) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render_sender(sender_id: &str, sender: &str, user: Option<&str>) -> Vec<Line<'static>> {
+        let mut state = MessagesState::default();
+        state.update_messages(
+            "Chat",
+            vec![api::MessageInfo {
+                id: "1".into(),
+                sender_id: sender_id.into(),
+                sender: sender.into(),
+                timestamp: "2026-09-18T12:00:00Z".into(),
+                content: "A new message".into(),
+                mentions: Vec::new(),
+            }],
+        );
+        build_message_lines(&state, 100, "My Name", user).0
+    }
+
+    #[test]
+    fn own_messages_use_identity_and_recover_missing_names() {
+        let expected = render_sender("8:orgid:self", "My Name", Some("self"));
+        for id in [
+            "self",
+            "8:orgid:SELF",
+            "orgid:self",
+            "https://chat/contacts/8:orgid:self",
+        ] {
+            for name in ["", " ", "?", "[unknown]", "My Name"] {
+                let lines = render_sender(id, name, Some("self"));
+                assert_eq!(lines, expected, "sender ID {id}, name {name:?}");
+                assert_eq!(lines[0].spans[0].content, " ".repeat(25));
+                assert_eq!(lines[0].spans[2].content, "My Name");
+                assert_eq!(lines[0].spans[2].style.bg, Some(Color::Rgb(45, 55, 70)));
+            }
+        }
+        let renamed = render_sender("8:orgid:self", "Previous Name", Some("self"));
+        assert_eq!(renamed[0].spans[0].content, " ".repeat(25));
+        assert_eq!(renamed[0].spans[2].content, "Previous Name");
+    }
+
+    #[test]
+    fn display_name_does_not_establish_ownership() {
+        for (sender, user) in [
+            ("8:orgid:other", Some("self")),
+            ("", Some("self")),
+            ("self", None),
+            ("self", Some("")),
+        ] {
+            let lines = render_sender(sender, "My Name", user);
+            assert_eq!(lines[0].spans[0].content, "> ");
+            assert_eq!(lines[0].spans[1].content, "My Name");
+            assert_eq!(lines[0].spans[1].style.bg, Some(Color::Rgb(55, 55, 70)));
+        }
+    }
 }
