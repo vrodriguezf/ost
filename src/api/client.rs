@@ -172,6 +172,36 @@ impl TeamsClient {
         check_response(resp, url).await
     }
 
+    /// Native directory lookup uses the Teams AAD audience, not a Graph token.
+    pub async fn fetch_profiles(&self, members: &[String]) -> Result<serde_json::Value> {
+        let base = self
+            .config
+            .get_region_gtms()
+            .and_then(|v| {
+                v.get("middleTier")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .context("No regional Teams directory endpoint")?;
+        let token = self
+            .config
+            .get_access_token()
+            .context("No Teams access token")?;
+        let url = format!("{}/beta/users/fetch", base.trim_end_matches('/'));
+        let response = self
+            .http
+            .post(&url)
+            .bearer_auth(&token.token)
+            .json(members)
+            .send()
+            .await?;
+        check_response(response, &url)
+            .await?
+            .json()
+            .await
+            .context("Invalid directory response")
+    }
+
     /// Chat service base URL from region_gtms, falling back to default.
     pub fn chat_service_url(&self) -> String {
         self.config

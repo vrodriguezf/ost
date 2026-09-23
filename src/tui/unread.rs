@@ -100,15 +100,7 @@ pub struct UnreadState {
 }
 
 /// Normalize an MRI or sender resource URL without using a display name.
-pub fn same_user(left: &str, right: &str) -> bool {
-    fn identity(value: &str) -> &str {
-        let tail = value.rsplit('/').next().unwrap_or(value);
-        tail.strip_prefix("8:orgid:")
-            .or_else(|| tail.strip_prefix("orgid:"))
-            .unwrap_or(tail)
-    }
-    !left.is_empty() && !right.is_empty() && identity(left).eq_ignore_ascii_case(identity(right))
-}
+pub use crate::api::names::same_user;
 
 impl UnreadState {
     #[cfg(not(test))]

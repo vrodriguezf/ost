@@ -29,6 +29,11 @@ pub enum BackendResponse {
     ConnectionState(ConnectionState),
     Teams(Result<Vec<api::TeamInfo>>),
     Chats(Result<Vec<api::ChatInfo>>),
+    ChatName {
+        chat_id: String,
+        name: String,
+        source: api::ChatNameSource,
+    },
     Messages {
         chat_id: String,
         result: Result<Vec<api::MessageInfo>>,
@@ -304,6 +309,53 @@ fn spawn_auxiliary(
     });
 }
 
+/// A separate worker keeps directory latency out of the message command loop.
+/// Latest-snapshot channel and one lookup at a time bound both memory and traffic.
+async fn resolve_chat_names(
+    mut snapshots: tokio::sync::watch::Receiver<Vec<String>>,
+    responses: mpsc::UnboundedSender<BackendResponse>,
+) {
+    let mut due: HashMap<String, time::Instant> = HashMap::new();
+    let mut tick = time::interval(Duration::from_millis(750));
+    tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            changed = snapshots.changed() => { if changed.is_err() { break; } }
+            _ = tick.tick() => {
+                let ids = snapshots.borrow().clone();
+                due.retain(|id, _| ids.contains(id));
+                let now = time::Instant::now();
+                let Some(id) = ids.into_iter().filter(|id| due.get(id).is_none_or(|at| *at <= now)).min_by_key(|id| due.get(id).copied()) else { continue; };
+                let result = time::timeout(Duration::from_secs(30), async {
+                    let client = client().await?;
+                    let user = match super::unread::configured_account() {
+                        Some((_, user)) => user,
+                        None => api::whoami_data(&client).await?.id,
+                    };
+                    api::names::resolve(&client, &id, &user).await
+                }).await;
+                let success = matches!(&result, Ok(Ok(_)));
+                due.insert(id.clone(), time::Instant::now() + Duration::from_secs(if success { 300 } else { 60 }));
+                match result {
+                    Ok(Ok((name, source))) => {
+                        if responses.send(BackendResponse::ChatName { chat_id: id, name, source }).is_err() { break; }
+                    }
+                    _ => tracing::debug!("Chat name lookup unavailable; retaining cached label"),
+                }
+            }
+        }
+    }
+}
+
+fn name_candidates(chats: &[api::ChatInfo]) -> Vec<String> {
+    chats
+        .iter()
+        .filter(|c| c.name_source != api::ChatNameSource::Topic)
+        .take(CHAT_LIMIT)
+        .map(|c| c.id.clone())
+        .collect()
+}
+
 async fn backend_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<BackendCommand>,
     resp_tx: mpsc::UnboundedSender<BackendResponse>,
@@ -311,6 +363,8 @@ async fn backend_loop(
     let (push_tx, mut push_rx) = mpsc::channel(64);
     let mut tasks = JoinSet::new();
     tasks.spawn(subscription::run(push_tx));
+    let (name_tx, name_rx) = tokio::sync::watch::channel(Vec::new());
+    tasks.spawn(resolve_chat_names(name_rx, resp_tx.clone()));
     let mut auxiliary_tasks = JoinSet::new();
     let mut auxiliary_running = HashSet::new();
     let mut auxiliary_retry = HashSet::new();
@@ -363,7 +417,9 @@ async fn backend_loop(
                     BackendCommand::LoadChats { limit } => {
                         let result = api::list_chats_data(&client, limit.min(CHAT_LIMIT)).await;
                         if let Ok(chats) = &result { tracker.reconcile_chats(chats, &mut pending); }
+                        let names = result.as_ref().ok().map(|chats| name_candidates(chats));
                         let _ = resp_tx.send(BackendResponse::Chats(result));
+                        if let Some(names) = names { name_tx.send_replace(names); }
                     }
                     BackendCommand::LoadMessages { chat_id, limit } => {
                         current_chat = Some(chat_id.clone());
@@ -442,7 +498,9 @@ async fn backend_loop(
                     chats_due = false;
                     let result = api::list_chats_data(&client, CHAT_LIMIT).await;
                     if let Ok(chats) = &result { tracker.reconcile_chats(chats, &mut pending); } else { healthy = false; }
+                    let names = result.as_ref().ok().map(|chats| name_candidates(chats));
                     let _ = resp_tx.send(BackendResponse::Chats(result));
+                    if let Some(names) = names { name_tx.send_replace(names); }
                 }
                 // One conversation per tick bounds traffic even during a burst.
                 if let Some(chat_id) = pending.pop() {

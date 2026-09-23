@@ -23,6 +23,7 @@ use super::search::{SearchResultKind, SearchState};
 use super::sidebar::SidebarState;
 use super::ui;
 use super::unread::{configured_account, MessageStamp, UnreadState};
+use crate::api;
 
 /// Active pane in the TUI
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,8 @@ pub struct App {
     notification_policy: NotificationPolicy,
     notification_service: Option<NotificationService>,
     pub unread: UnreadState,
+    chat_names: super::chat_names::ChatNames,
+    chat_topics: std::collections::HashSet<String>,
     /// Newest loaded identity; selection or loading alone never acknowledges it.
     pub loaded_last_stamp: Option<MessageStamp>,
     rendered_chat_id: Option<String>,
@@ -124,6 +127,8 @@ impl App {
             notification_policy: NotificationPolicy::from_env(),
             notification_service: None,
             unread: UnreadState::default(),
+            chat_names: Default::default(),
+            chat_topics: Default::default(),
             loaded_last_stamp: None,
             rendered_chat_id: None,
             manual_unread_hold: None,
@@ -670,15 +675,43 @@ impl App {
                 self.sidebar.loading = false;
             }
             BackendResponse::Chats(Ok(chats)) => {
+                self.chat_topics = chats
+                    .iter()
+                    .filter(|c| c.name_source == api::ChatNameSource::Topic)
+                    .map(|c| c.id.clone())
+                    .collect();
                 for chat in &chats {
                     self.unread
                         .observe_chat(chat, self.current_user_id.as_deref());
                 }
                 self.sidebar
                     .update_chats(chats, self.current_user_id.as_deref());
+                self.chat_names.restore(&mut self.sidebar.chats);
                 self.sync_chat_header();
                 self.sidebar.apply_unread(&self.unread);
                 self.sidebar.loading = false;
+            }
+            BackendResponse::ChatName {
+                chat_id,
+                name,
+                source,
+            } => {
+                if let Some(chat) = self
+                    .sidebar
+                    .chats
+                    .iter_mut()
+                    .find(|chat| chat.id == chat_id)
+                {
+                    if api::names::valid_name(&name)
+                        && !self.chat_topics.contains(&chat_id)
+                        && (source != api::ChatNameSource::LastSender
+                            || chat.name_source == api::ChatNameSource::Identifier)
+                    {
+                        chat.name = name;
+                        chat.name_source = source;
+                    }
+                }
+                self.sync_chat_header();
             }
             BackendResponse::Chats(Err(e)) => {
                 self.set_error(format!("Failed to load chats: {:#}", e));
@@ -761,6 +794,10 @@ impl App {
                 self.set_error(format!("Auth: {}", msg));
             }
         }
+        self.chat_names.remember(&self.sidebar.chats);
+        if let Err(error) = self.chat_names.save() {
+            tracing::warn!("Chat names not saved: {error:#}");
+        }
         if self.search.active {
             self.search.update_results(&self.sidebar, &self.messages);
             self.search.selected = selected_search_key
@@ -811,6 +848,15 @@ impl App {
         match UnreadState::load_for_account(tenant, user) {
             Ok(state) => self.unread = state,
             Err(error) => self.set_error(format!("Unread state unavailable: {error:#}")),
+        }
+        #[cfg(not(test))]
+        match super::chat_names::ChatNames::load_for_account(tenant, user) {
+            Ok(names) => {
+                self.chat_names = names;
+                self.chat_names.restore(&mut self.sidebar.chats);
+                self.sync_chat_header();
+            }
+            Err(error) => tracing::warn!("Chat name cache unavailable: {error:#}"),
         }
         self.current_user_id = Some(user.to_owned());
         for message in std::mem::take(&mut self.deferred_incoming) {

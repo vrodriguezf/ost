@@ -4,6 +4,7 @@ mod chat;
 pub mod client;
 mod graph;
 mod me;
+pub(crate) mod names;
 mod presence;
 mod teams;
 

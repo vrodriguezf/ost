@@ -122,7 +122,8 @@ impl SidebarState {
                     old.name_source != api::ChatNameSource::Identifier
                         && !old.name.trim().is_empty()
                 });
-                let peer_name = c.name_source == api::ChatNameSource::LastSender
+                let peer_name = !c.is_group
+                    && c.name_source == api::ChatNameSource::LastSender
                     && current_user
                         .zip(c.last_message_sender_id.as_deref())
                         .is_some_and(|(user, sender)| {
@@ -133,10 +134,10 @@ impl SidebarState {
                         (c.name, c.name_source)
                     } else if let Some(known) = known {
                         (known.name.clone(), known.name_source)
-                    } else if peer_name && !c.name.trim().is_empty() {
+                    } else if peer_name && api::names::valid_name(&c.name) {
                         (c.name, c.name_source)
                     } else {
-                        (c.id.clone(), api::ChatNameSource::Identifier)
+                        (api::names::UNKNOWN.into(), api::ChatNameSource::Identifier)
                     };
                 Chat {
                     name,
@@ -166,13 +167,13 @@ impl SidebarState {
             return false;
         }
         let name = sender.trim();
-        if name.is_empty() || name == "?" || name == "[unknown]" || name == sender_id {
+        if !api::names::valid_name(name) || name == sender_id {
             return false;
         }
         let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == chat_id) else {
             return false;
         };
-        if chat.name_source != api::ChatNameSource::Identifier {
+        if chat.is_group || chat.name_source != api::ChatNameSource::Identifier {
             return false;
         }
         chat.name = name.to_owned();

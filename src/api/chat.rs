@@ -4,7 +4,7 @@
 //! bypassing Graph API which requires tenant admin consent for Chat.Read.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::client::TeamsClient;
 
@@ -34,6 +34,8 @@ struct ConversationProperties {
 #[derive(Debug, Deserialize)]
 struct ThreadProperties {
     topic: Option<String>,
+    #[serde(rename = "productThreadType")]
+    product_thread_type: Option<String>,
     #[serde(rename = "lastjoinat")]
     last_join_at: Option<String>,
     /// For 1:1 chats, contains member MRIs
@@ -198,9 +200,10 @@ pub async fn send_message_with_client(
 // ---------------------------------------------------------------------------
 
 /// A message sender is only a naming hint, never a conversation rename.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatNameSource {
     Topic,
+    Participants,
     LastSender,
     Identifier,
 }
@@ -303,7 +306,11 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
         }
 
         let (name, name_source) = conversation_name(conv);
-        let is_group = id.contains("thread") || id.contains("meeting");
+        let is_group = conv
+            .thread_properties
+            .as_ref()
+            .and_then(|p| p.product_thread_type.as_deref())
+            != Some("OneToOneChat");
 
         let (last_time, last_sender, last_preview) = if let Some(ref msg) = conv.last_message {
             let time = msg

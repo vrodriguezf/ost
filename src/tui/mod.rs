@@ -5,6 +5,7 @@
 mod activity;
 mod app;
 mod backend;
+mod chat_names;
 mod compose;
 mod debug_log;
 mod help;

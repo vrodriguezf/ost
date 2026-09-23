@@ -215,8 +215,9 @@ fn history_recovers_an_unresolved_name_from_a_peer_without_renaming_known_chats(
     unresolved.name_source = crate::api::ChatNameSource::LastSender;
     unresolved.last_message_sender_id = Some("8:orgid:me".into());
     app.sidebar.chats.clear();
+    app.chat_names = Default::default();
     app.handle_backend_response(BackendResponse::Chats(Ok(vec![unresolved])), &backend);
-    assert_eq!(app.sidebar.chats[0].name, "active");
+    assert_eq!(app.sidebar.chats[0].name, crate::api::names::UNKNOWN);
 
     let peer = message("active", "1");
     let mut own = message("active", "2");
@@ -350,4 +351,111 @@ fn presence_cannot_hide_degraded_reception_and_own_activity_is_silent() {
     app.handle_backend_response(BackendResponse::IncomingMessage(own), &backend);
     assert!(!app.unread.badge("background").any());
     assert!(alerts.try_recv().is_err());
+}
+
+#[test]
+fn background_names_update_without_opening_and_preserve_drafts_and_selection() {
+    use crate::api::ChatNameSource as Source;
+    let (mut app, backend, _) = setup();
+    let mut unresolved = chat("unopened");
+    unresolved.name_source = Source::Identifier;
+    app.handle_backend_response(
+        BackendResponse::Chats(Ok(vec![chat("active"), unresolved])),
+        &backend,
+    );
+    app.compose.input = "Draft stays".into();
+    app.messages.viewport.offset = 3;
+    app.search.activate();
+    app.search.query = "Alice".into();
+    let selected = app.sidebar.selected_item_id();
+    let current = app.current_chat_id.clone();
+    app.handle_backend_response(
+        BackendResponse::ChatName {
+            chat_id: "unopened".into(),
+            name: "Alice".into(),
+            source: Source::Participants,
+        },
+        &backend,
+    );
+    assert_eq!(app.sidebar.chats[1].name, "Alice");
+    assert_eq!(app.sidebar.selected_item_id(), selected);
+    assert_eq!(app.current_chat_id, current);
+    assert_eq!(app.compose.input, "Draft stays");
+    assert_eq!(app.messages.viewport.offset, 3);
+    assert!(!app.search.results.is_empty());
+
+    let mut own = chat("unopened");
+    own.name_source = Source::LastSender;
+    own.name = "Me".into();
+    own.last_message_sender_id = Some("8:orgid:me".into());
+    app.handle_backend_response(
+        BackendResponse::Chats(Ok(vec![chat("active"), own])),
+        &backend,
+    );
+    assert_eq!(app.sidebar.chats[1].name, "Alice");
+    app.handle_backend_response(
+        BackendResponse::ChatName {
+            chat_id: "unopened".into(),
+            name: "Alice Smith".into(),
+            source: Source::Participants,
+        },
+        &backend,
+    );
+    assert_eq!(app.sidebar.chats[1].name, "Alice Smith");
+    app.handle_backend_response(
+        BackendResponse::ChatName {
+            chat_id: "unopened".into(),
+            name: "Old sender".into(),
+            source: Source::LastSender,
+        },
+        &backend,
+    );
+    assert_eq!(app.sidebar.chats[1].name, "Alice Smith");
+}
+
+#[test]
+fn unnamed_group_does_not_take_a_single_senders_name() {
+    let (mut app, backend, _) = setup();
+    let mut group = chat("group");
+    group.is_group = true;
+    group.name_source = crate::api::ChatNameSource::LastSender;
+    group.name = "Alice".into();
+    group.last_message_sender_id = Some("alice".into());
+    app.handle_backend_response(BackendResponse::Chats(Ok(vec![group])), &backend);
+    assert_eq!(app.sidebar.chats[0].name, crate::api::names::UNKNOWN);
+    assert!(!app
+        .sidebar
+        .recover_chat_name("group", "alice", "Alice", Some("me")));
+}
+
+#[test]
+fn confirmed_roster_replaces_cached_topic_but_not_newer_explicit_title() {
+    use crate::api::ChatNameSource as Source;
+    let (mut app, backend, _) = setup();
+    let mut missing = chat("active");
+    missing.name_source = Source::Identifier;
+    app.handle_backend_response(BackendResponse::Chats(Ok(vec![missing])), &backend);
+    assert_eq!(app.sidebar.chats[0].name, "Conversation active");
+    app.handle_backend_response(
+        BackendResponse::ChatName {
+            chat_id: "active".into(),
+            name: "Alice, Bob".into(),
+            source: Source::Participants,
+        },
+        &backend,
+    );
+    assert_eq!(app.sidebar.chats[0].name, "Alice, Bob");
+    assert_eq!(app.channel_name, "Alice, Bob");
+    let mut titled = chat("active");
+    titled.name = "New title".into();
+    app.handle_backend_response(BackendResponse::Chats(Ok(vec![titled])), &backend);
+    app.handle_backend_response(
+        BackendResponse::ChatName {
+            chat_id: "active".into(),
+            name: "Stale title".into(),
+            source: Source::Topic,
+        },
+        &backend,
+    );
+    assert_eq!(app.sidebar.chats[0].name, "New title");
 }
