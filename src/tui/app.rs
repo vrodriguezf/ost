@@ -674,6 +674,13 @@ impl App {
                 self.set_error(format!("Failed to load teams: {:#}", e));
                 self.sidebar.loading = false;
             }
+            BackendResponse::ChannelSummaries(channels) => {
+                for channel in &channels {
+                    self.unread
+                        .observe_chat(channel, self.current_user_id.as_deref());
+                }
+                self.sidebar.apply_unread(&self.unread);
+            }
             BackendResponse::Chats(Ok(chats)) => {
                 self.chat_topics = chats
                     .iter()

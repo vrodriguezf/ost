@@ -459,3 +459,40 @@ fn confirmed_roster_replaces_cached_topic_but_not_newer_explicit_title() {
     );
     assert_eq!(app.sidebar.chats[0].name, "New title");
 }
+
+#[test]
+fn channel_summaries_preserve_hierarchy_selection_and_drafts_without_adding_chats() {
+    let (mut app, backend, _) = setup();
+    let teams = || {
+        vec![api::TeamInfo {
+            id: "team".into(),
+            name: "Research team".into(),
+            channels: vec![api::ChannelInfo {
+                id: "channel".into(),
+                name: "Research".into(),
+            }],
+        }]
+    };
+    app.handle_backend_response(BackendResponse::Teams(Ok(teams())), &backend);
+    app.sidebar.teams_expanded = true;
+    app.sidebar.teams[0].expanded = false;
+    app.sidebar.selected = app.sidebar.flat_items().iter().position(|item| {
+        matches!(item, super::super::sidebar::SidebarItem::Chat(index) if app.sidebar.chats[*index].id == "active")
+    }).unwrap();
+    let selection = app.sidebar.selected_item_id();
+    app.compose.input = "Unsent draft".into();
+    let mut summary = chat("channel");
+    summary.has_unread = Some(true);
+    summary.last_message_id = Some("42".into());
+    summary.last_message_type = Some("RichText/Html".into());
+    summary.last_message_sender_id = Some("8:orgid:other".into());
+    app.handle_backend_response(BackendResponse::ChannelSummaries(vec![summary]), &backend);
+    app.handle_backend_response(BackendResponse::Teams(Ok(teams())), &backend);
+    assert_eq!(app.sidebar.chats.len(), 2);
+    assert!(!app.sidebar.chats.iter().any(|chat| chat.id == "channel"));
+    assert!(app.sidebar.teams[0].channels[0].unread.any());
+    assert!(app.sidebar.teams_expanded);
+    assert!(!app.sidebar.teams[0].expanded);
+    assert_eq!(app.sidebar.selected_item_id(), selection);
+    assert_eq!(app.compose.input, "Unsent draft");
+}

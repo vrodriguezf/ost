@@ -16,10 +16,10 @@ struct ConversationsResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct Conversation {
-    id: Option<String>,
+pub(super) struct Conversation {
+    pub(super) id: Option<String>,
     #[serde(rename = "threadProperties")]
-    thread_properties: Option<ThreadProperties>,
+    pub(super) thread_properties: Option<ThreadProperties>,
     #[serde(rename = "lastMessage")]
     last_message: Option<NativeMessage>,
     properties: Option<ConversationProperties>,
@@ -32,10 +32,12 @@ struct ConversationProperties {
 }
 
 #[derive(Debug, Deserialize)]
-struct ThreadProperties {
+pub(super) struct ThreadProperties {
     topic: Option<String>,
     #[serde(rename = "productThreadType")]
-    product_thread_type: Option<String>,
+    pub(super) product_thread_type: Option<String>,
+    #[serde(flatten)]
+    pub(super) extra: serde_json::Map<String, serde_json::Value>,
     #[serde(rename = "lastjoinat")]
     last_join_at: Option<String>,
     /// For 1:1 chats, contains member MRIs
@@ -256,8 +258,30 @@ fn native_has_unread(conversation: &Conversation) -> Option<bool> {
     Some(message_id > read_id)
 }
 
+/// Internal account feeds are not conversations, even when they contain text.
+pub(crate) fn is_activity_stream(id: &str) -> bool {
+    id.rsplit('/').next().unwrap_or(id).starts_with("48:")
+}
+
+/// Only actual chats belong in Chats. Older responses may omit product type.
+fn chat_is_group(id: &str, product_type: Option<&str>) -> Option<bool> {
+    if is_activity_stream(id) || id.ends_with("@thread.tacv2") {
+        return None;
+    }
+    match product_type {
+        Some("OneToOneChat") => Some(false),
+        Some("Chat" | "Meeting") => Some(true),
+        None if id.ends_with("@unq.gbl.spaces") => Some(false),
+        None if id.ends_with("@thread.v2") || id.ends_with("@thread.skype") => Some(true),
+        _ => None,
+    }
+}
+
 /// List recent chats and return structured data.
-pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<ChatInfo>> {
+pub(super) async fn list_conversations(
+    client: &TeamsClient,
+    limit: usize,
+) -> Result<Vec<Conversation>> {
     // Strategy 1: CSA AFD endpoint with Bearer auth
     let csa_url = format!(
         "https://teams.microsoft.com/api/csa/api/v1/teams/users/ME/conversations?view=mychats&pageSize={}",
@@ -296,21 +320,63 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
         .await
         .context("Failed to parse conversations response")?;
 
-    let conversations = body.conversations.unwrap_or_default();
+    Ok(body.conversations.unwrap_or_default())
+}
 
+pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<ChatInfo>> {
+    Ok(list_recent_data(client, limit).await?.chats)
+}
+
+pub(crate) struct RecentConversations {
+    pub chats: Vec<ChatInfo>,
+    pub channels: Vec<ChatInfo>,
+}
+
+pub(crate) async fn list_recent_data(
+    client: &TeamsClient,
+    limit: usize,
+) -> Result<RecentConversations> {
+    let conversations = list_conversations(client, limit).await?;
+    Ok(RecentConversations {
+        chats: conversation_infos(&conversations, false),
+        channels: conversation_infos(&conversations, true),
+    })
+}
+
+fn conversation_infos(conversations: &[Conversation], channels: bool) -> Vec<ChatInfo> {
     let mut chats = Vec::new();
-    for conv in &conversations {
+    for conv in conversations {
         let id = conv.id.as_deref().unwrap_or("").to_string();
         if id.is_empty() {
             continue;
         }
 
-        let (name, name_source) = conversation_name(conv);
-        let is_group = conv
-            .thread_properties
-            .as_ref()
-            .and_then(|p| p.product_thread_type.as_deref())
-            != Some("OneToOneChat");
+        let props = conv.thread_properties.as_ref();
+        let product_type = props.and_then(|p| p.product_thread_type.as_deref());
+        let (is_group, name, name_source) = if channels {
+            if !matches!(
+                product_type,
+                Some("TeamsTeam" | "TeamsChannel" | "TeamsPrivateChannel" | "TeamsSharedChannel")
+            ) {
+                continue;
+            }
+            let name = props
+                .and_then(|p| {
+                    p.extra
+                        .get("topicThreadTopic")
+                        .or_else(|| p.extra.get("spaceThreadTopic"))
+                })
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("Unnamed channel");
+            (true, name.to_owned(), ChatNameSource::Topic)
+        } else {
+            let Some(is_group) = chat_is_group(&id, product_type) else {
+                continue;
+            };
+            let (name, source) = conversation_name(conv);
+            (is_group, name, source)
+        };
 
         let (last_time, last_sender, last_preview) = if let Some(ref msg) = conv.last_message {
             let time = msg
@@ -357,7 +423,7 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
         });
     }
 
-    Ok(chats)
+    chats
 }
 
 /// Read messages from a specific chat thread and return structured data.
@@ -551,5 +617,56 @@ mod unread_metadata_tests {
         let missing: Conversation =
             serde_json::from_value(serde_json::json!({"id":"chat"})).unwrap();
         assert_eq!(native_has_unread(&missing), None);
+    }
+}
+
+#[cfg(test)]
+mod conversation_type_tests {
+    use super::*;
+
+    #[test]
+    fn activity_feeds_and_channels_never_become_chats() {
+        let fixtures = [
+            ("48:notifications", "StreamOfNotifications"),
+            ("48:mentions", "StreamOfMentions"),
+            ("48:threads", "StreamOfThreads"),
+            ("48:notes", "StreamOfNotes"),
+            ("19:team@thread.tacv2", "TeamsTeam"),
+            ("19:private@thread.tacv2", "TeamsPrivateChannel"),
+            ("19:shared@thread.tacv2", "TeamsSharedChannel"),
+            ("19:direct@unq.gbl.spaces", "OneToOneChat"),
+            ("19:group@thread.v2", "Chat"),
+            ("19:meeting@thread.v2", "Meeting"),
+        ];
+        let conversations: Vec<Conversation> = fixtures
+            .iter()
+            .map(|(id, kind)| {
+                serde_json::from_value(serde_json::json!({
+                "id": id,
+                "threadProperties": {"productThreadType": kind, "spaceThreadTopic": "Native title"},
+                "lastMessage": {"imdisplayname": "Sender", "id": "42"}
+            })).unwrap()
+            })
+            .collect();
+        let chats = conversation_infos(&conversations, false);
+        assert_eq!(
+            chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec![fixtures[7].0, fixtures[8].0, fixtures[9].0]
+        );
+        assert!(!chats[0].is_group);
+        assert!(chats[1].is_group && chats[2].is_group);
+        let channels = conversation_infos(&conversations, true);
+        assert_eq!(channels.len(), 3);
+        assert!(channels
+            .iter()
+            .all(|c| c.name == "Native title" && c.last_message_id.as_deref() == Some("42")));
+        assert_eq!(chat_is_group("48:notifications", Some("Chat")), None);
+        assert_eq!(chat_is_group("19:private@thread.tacv2", None), None);
+        assert_eq!(chat_is_group("19:direct@unq.gbl.spaces", None), Some(false));
+        assert_eq!(chat_is_group("19:group@thread.v2", None), Some(true));
+        assert_eq!(
+            chat_is_group("19:unknown@thread.v2", Some("FutureSystemType")),
+            None
+        );
     }
 }

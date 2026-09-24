@@ -29,6 +29,7 @@ pub enum BackendResponse {
     ConnectionState(ConnectionState),
     Teams(Result<Vec<api::TeamInfo>>),
     Chats(Result<Vec<api::ChatInfo>>),
+    ChannelSummaries(Vec<api::ChatInfo>),
     ChatName {
         chat_id: String,
         name: String,
@@ -119,6 +120,9 @@ struct PendingChats {
 
 impl PendingChats {
     fn insert(&mut self, id: String) {
+        if api::is_activity_stream(&id) {
+            return;
+        }
         if self.ids.len() < MAX_PENDING && self.ids.insert(id.clone()) {
             self.order.push_back(id);
         }
@@ -154,7 +158,11 @@ impl ActivityTracker {
         }
     }
 
-    fn reconcile_chats(&mut self, chats: &[api::ChatInfo], pending: &mut PendingChats) {
+    fn reconcile_chats<'a>(
+        &mut self,
+        chats: impl IntoIterator<Item = &'a api::ChatInfo>,
+        pending: &mut PendingChats,
+    ) {
         for chat in chats {
             let signature = format!(
                 "{:?}|{:?}|{:?}|{:?}",
@@ -311,8 +319,14 @@ fn spawn_auxiliary(
 
 /// A separate worker keeps directory latency out of the message command loop.
 /// Latest-snapshot channel and one lookup at a time bound both memory and traffic.
+#[derive(Clone)]
+struct NameCandidate {
+    id: String,
+    is_group: bool,
+}
+
 async fn resolve_chat_names(
-    mut snapshots: tokio::sync::watch::Receiver<Vec<String>>,
+    mut snapshots: tokio::sync::watch::Receiver<Vec<NameCandidate>>,
     responses: mpsc::UnboundedSender<BackendResponse>,
 ) {
     let mut due: HashMap<String, time::Instant> = HashMap::new();
@@ -323,16 +337,17 @@ async fn resolve_chat_names(
             changed = snapshots.changed() => { if changed.is_err() { break; } }
             _ = tick.tick() => {
                 let ids = snapshots.borrow().clone();
-                due.retain(|id, _| ids.contains(id));
+                due.retain(|id, _| ids.iter().any(|candidate| candidate.id == *id));
                 let now = time::Instant::now();
-                let Some(id) = ids.into_iter().filter(|id| due.get(id).is_none_or(|at| *at <= now)).min_by_key(|id| due.get(id).copied()) else { continue; };
+                let Some(candidate) = ids.into_iter().filter(|candidate| due.get(&candidate.id).is_none_or(|at| *at <= now)).min_by_key(|candidate| due.get(&candidate.id).copied()) else { continue; };
+                let id = candidate.id;
                 let result = time::timeout(Duration::from_secs(30), async {
                     let client = client().await?;
                     let user = match super::unread::configured_account() {
                         Some((_, user)) => user,
                         None => api::whoami_data(&client).await?.id,
                     };
-                    api::names::resolve(&client, &id, &user).await
+                    api::names::resolve(&client, &id, &user, candidate.is_group).await
                 }).await;
                 let success = matches!(&result, Ok(Ok(_)));
                 due.insert(id.clone(), time::Instant::now() + Duration::from_secs(if success { 300 } else { 60 }));
@@ -347,13 +362,40 @@ async fn resolve_chat_names(
     }
 }
 
-fn name_candidates(chats: &[api::ChatInfo]) -> Vec<String> {
+fn name_candidates(chats: &[api::ChatInfo]) -> Vec<NameCandidate> {
     chats
         .iter()
         .filter(|c| c.name_source != api::ChatNameSource::Topic)
         .take(CHAT_LIMIT)
-        .map(|c| c.id.clone())
+        .map(|c| NameCandidate {
+            id: c.id.clone(),
+            is_group: c.is_group,
+        })
         .collect()
+}
+
+async fn refresh_chats(
+    client: &TeamsClient,
+    limit: usize,
+    tracker: &mut ActivityTracker,
+    pending: &mut PendingChats,
+    responses: &mpsc::UnboundedSender<BackendResponse>,
+    names: &tokio::sync::watch::Sender<Vec<NameCandidate>>,
+) -> bool {
+    match api::list_recent_data(client, limit).await {
+        Ok(recent) => {
+            tracker.reconcile_chats(recent.chats.iter().chain(&recent.channels), pending);
+            let candidates = name_candidates(&recent.chats);
+            let _ = responses.send(BackendResponse::ChannelSummaries(recent.channels));
+            let _ = responses.send(BackendResponse::Chats(Ok(recent.chats)));
+            names.send_replace(candidates);
+            true
+        }
+        Err(error) => {
+            let _ = responses.send(BackendResponse::Chats(Err(error)));
+            false
+        }
+    }
 }
 
 async fn backend_loop(
@@ -415,11 +457,7 @@ async fn backend_loop(
                 match command {
                     BackendCommand::LoadTeams => { let _ = resp_tx.send(BackendResponse::Teams(api::list_teams_data(&client).await)); }
                     BackendCommand::LoadChats { limit } => {
-                        let result = api::list_chats_data(&client, limit.min(CHAT_LIMIT)).await;
-                        if let Ok(chats) = &result { tracker.reconcile_chats(chats, &mut pending); }
-                        let names = result.as_ref().ok().map(|chats| name_candidates(chats));
-                        let _ = resp_tx.send(BackendResponse::Chats(result));
-                        if let Some(names) = names { name_tx.send_replace(names); }
+                        refresh_chats(&client, limit.min(CHAT_LIMIT), &mut tracker, &mut pending, &resp_tx, &name_tx).await;
                     }
                     BackendCommand::LoadMessages { chat_id, limit } => {
                         current_chat = Some(chat_id.clone());
@@ -496,11 +534,7 @@ async fn backend_loop(
                 let mut healthy = true;
                 if chats_due {
                     chats_due = false;
-                    let result = api::list_chats_data(&client, CHAT_LIMIT).await;
-                    if let Ok(chats) = &result { tracker.reconcile_chats(chats, &mut pending); } else { healthy = false; }
-                    let names = result.as_ref().ok().map(|chats| name_candidates(chats));
-                    let _ = resp_tx.send(BackendResponse::Chats(result));
-                    if let Some(names) = names { name_tx.send_replace(names); }
+                    healthy = refresh_chats(&client, CHAT_LIMIT, &mut tracker, &mut pending, &resp_tx, &name_tx).await;
                 }
                 // One conversation per tick bounds traffic even during a burst.
                 if let Some(chat_id) = pending.pop() {
@@ -547,6 +581,19 @@ fn deliver_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_feed_invalidations_are_not_polled_as_messages() {
+        let mut pending = PendingChats::default();
+        for id in ["48:notifications", "48:mentions", "48:notes", "48:threads"] {
+            pending.insert(id.into());
+        }
+        pending.insert("19:private@thread.tacv2".into());
+        pending.insert("19:direct@unq.gbl.spaces".into());
+        assert_eq!(pending.pop().as_deref(), Some("19:private@thread.tacv2"));
+        assert_eq!(pending.pop().as_deref(), Some("19:direct@unq.gbl.spaces"));
+        assert!(pending.pop().is_none());
+    }
     fn message(id: &str, timestamp: &str) -> api::MessageInfo {
         api::MessageInfo {
             id: id.into(),

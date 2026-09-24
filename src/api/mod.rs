@@ -11,7 +11,7 @@ mod teams;
 use anyhow::Result;
 
 // Re-export data types for TUI integration
-pub(crate) use chat::message_sort_key;
+pub(crate) use chat::{is_activity_stream, list_recent_data, message_sort_key};
 pub use chat::{ChatInfo, ChatNameSource, MessageInfo};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
@@ -23,7 +23,7 @@ pub use teams::TeamInfo;
 pub use teams::ChannelInfo;
 
 // Re-export data-returning functions for TUI integration
-pub use chat::{list_chats_data, read_messages_data, send_message_with_client};
+pub use chat::{read_messages_data, send_message_with_client};
 pub use me::whoami_data;
 pub use presence::get_presence_data;
 pub use teams::list_teams_data;
