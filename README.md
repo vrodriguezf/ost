@@ -79,6 +79,20 @@ For full A/V support:
 cargo build --features "audio,video-capture"
 ```
 
+### Install or update the executable
+
+`cargo build` compiles the development executable to `target/debug/teams-cli`; it does not update the installed `teams-cli` command. Likewise, `cargo build --release` only updates `target/release/teams-cli`.
+
+To install or reinstall the current checkout, run from the repository directory:
+
+```bash
+cargo install --path . --locked --root ~/.local --force
+```
+
+This installs `~/.local/bin/teams-cli`. Ensure `~/.local/bin` is on your `PATH`, and use `command -v teams-cli` to check which executable your shell launches. If you need optional features, add the corresponding flag, such as `--features audio`, to the install command.
+
+After installing an update, exit any running TUI and launch `teams-cli tui` again. To try a development build without installing it, run `cargo run -- tui` from the repository directory.
+
 ## Usage
 
 ### TUI (Terminal User Interface)
