@@ -6,6 +6,7 @@ mod graph;
 mod me;
 pub(crate) mod names;
 mod presence;
+mod reactions;
 mod teams;
 
 use anyhow::Result;
@@ -15,6 +16,7 @@ pub(crate) use chat::{is_activity_stream, list_recent_data, message_sort_key};
 pub use chat::{ChatInfo, ChatNameSource, MessageInfo};
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
+pub use reactions::{change_reaction, read_reactions, Reaction};
 pub use teams::TeamInfo;
 
 // Re-export ChannelInfo for use in TUI sidebar (currently consumed

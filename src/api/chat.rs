@@ -237,6 +237,7 @@ pub struct MessageInfo {
     pub timestamp: String,
     pub content: String,
     pub mentions: Vec<String>,
+    pub reactions: Vec<super::Reaction>,
 }
 
 /// The native consumption horizon identifies the newest consumed message. It
@@ -480,6 +481,7 @@ pub async fn read_messages_data(
             timestamp: time,
             content: text.trim().to_string(),
             mentions: explicit_mentions(msg.properties.as_ref()),
+            reactions: super::reactions::parse_reactions(msg.properties.as_ref()),
         });
     }
 

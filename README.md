@@ -115,6 +115,13 @@ Mouse controls are enabled automatically:
 
 Keyboard navigation remains available. For terminal text selection, use your terminal's mouse-capture override (commonly Shift+drag). Mouse capture is released when OST exits.
 
+To react, focus the messages pane, select a message, and press **+**. Use **Up/Down**
+or **j/k** to choose a reaction, **Enter** to apply it, and **Esc** to close the
+picker. Reactions you already added show **Remove**; selecting one removes only
+your reaction. Counts appear below each message, with **(you)** beside your own
+reactions. Updates preserve your draft and reading position. Closing the picker
+while an update is pending does not cancel the request already sent.
+
 ### Live updates
 
 Chat names remain stable when refreshes omit a title or change the latest sender.

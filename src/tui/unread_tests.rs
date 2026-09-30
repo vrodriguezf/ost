@@ -24,6 +24,7 @@ fn message(id: &str, lines: usize) -> api::MessageInfo {
         sender: event.sender,
         timestamp: event.timestamp,
         content: "message line\n".repeat(lines),
+        reactions: Vec::new(),
         mentions: vec![],
     }
 }

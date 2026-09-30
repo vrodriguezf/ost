@@ -171,7 +171,7 @@ const ACTIONS: Category = Category {
         },
         Shortcut {
             key: "+",
-            desc: "Add reaction",
+            desc: "Add/remove reaction",
         },
         Shortcut {
             key: "@",

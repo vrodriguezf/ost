@@ -482,6 +482,7 @@ mod tests {
             sender: event.sender,
             timestamp: event.timestamp,
             content: event.content,
+            reactions: Vec::new(),
             mentions: vec![],
         }
     }
