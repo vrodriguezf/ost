@@ -1030,6 +1030,30 @@ impl Drop for TerminalSession {
     }
 }
 
+fn draw_with_links(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    painter: &mut super::hyperlinks::Painter,
+) -> Result<()> {
+    use ratatui::backend::Backend as _;
+    use std::io::Write;
+    let completed = terminal.draw(|frame| app.render(frame))?;
+    let links = if app.show_help || app.search.active {
+        &[][..]
+    } else {
+        &app.messages.links
+    };
+    let cells = painter.cells(completed.buffer, links);
+    if !cells.is_empty() {
+        let backend = terminal.backend_mut();
+        crossterm::queue!(backend, crossterm::cursor::SavePosition)?;
+        backend.draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+        crossterm::queue!(backend, crossterm::cursor::RestorePosition)?;
+        Write::flush(backend)?;
+    }
+    Ok(())
+}
+
 async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Result<()> {
     let mut app = App::new(log_buffer);
     if let Some((tenant, user)) = configured_account() {
@@ -1050,12 +1074,13 @@ async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Resul
     backend.send(BackendCommand::LoadUserInfo);
     backend.send(BackendCommand::LoadPresence);
 
+    let mut link_painter = super::hyperlinks::Painter::default();
     while !app.should_exit {
         // Drain log buffer before rendering to keep it from growing unbounded.
         app.debug_log.refresh();
-        terminal.draw(|frame| app.render(frame))?;
+        draw_with_links(terminal, &mut app, &mut link_painter)?;
         if app.acknowledge_rendered() {
-            terminal.draw(|frame| app.render(frame))?;
+            draw_with_links(terminal, &mut app, &mut link_painter)?;
         }
 
         tokio::select! {

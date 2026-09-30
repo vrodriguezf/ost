@@ -560,8 +560,11 @@ fn terminal_session_fixture() {
         let mut h = Harness::new();
         h.add_chats(40);
         h.add_messages(20);
+        h.app.messages.messages[0].content =
+            format!("https://example.com/{}?a=1&b=2", "long/".repeat(30));
+        let mut painter = super::super::hyperlinks::Painter::default();
         while !h.app.should_exit {
-            terminal.draw(|frame| h.app.render(frame))?;
+            draw_with_links(&mut terminal, &mut h.app, &mut painter)?;
             h.app.handle_event(crossterm::event::read()?, &h.backend);
         }
         assert_eq!(h.app.compose.input, "mouse draft");

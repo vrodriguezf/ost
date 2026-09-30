@@ -9,6 +9,7 @@ mod chat_names;
 mod compose;
 mod debug_log;
 mod help;
+mod hyperlinks;
 mod log_capture;
 mod messages;
 mod mouse;

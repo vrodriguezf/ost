@@ -115,6 +115,9 @@ Mouse controls are enabled automatically:
 
 Keyboard navigation remains available. For terminal text selection, use your terminal's mouse-capture override (commonly Shift+drag). Mouse capture is released when OST exits.
 
+Long message URLs wrap within the pane and retain their full destination through terminal hyperlinks (OSC 8). Use your terminal's link-opening shortcut, such as Ctrl+Shift+click in Kitty. Terminals or multiplexers without OSC 8 support may still detect only the visible URL fragment.
+
+
 ### Live updates
 
 Chat names remain stable when refreshes omit a title or change the latest sender.

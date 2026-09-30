@@ -9,8 +9,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Widget},
 };
 
+use super::hyperlinks::{self, Link};
 use super::mouse::{HitMap, Target, Viewport};
 use crate::api;
+use unicode_width::UnicodeWidthStr;
 
 /// Default header shown when no channel is selected.
 const DEFAULT_HEADER: &str = "Select a channel or chat";
@@ -58,6 +60,8 @@ pub struct Message {
 
 /// State for the messages pane.
 pub struct MessagesState {
+    /// Full URL targets at terminal coordinates from the latest render.
+    pub links: Vec<Link>,
     /// Channel header text (e.g., "Engineering Team > #general").
     pub channel_header: String,
     /// All messages in the channel.
@@ -81,6 +85,7 @@ impl Default for MessagesState {
     fn default() -> Self {
         Self {
             channel_header: DEFAULT_HEADER.to_string(),
+            links: Vec::new(),
             messages: Vec::new(),
             expanded_threads: Vec::new(),
             viewport: Viewport::default(),
@@ -220,6 +225,7 @@ pub fn render(
     current_user_id: Option<&str>,
     hits: &mut HitMap,
 ) {
+    state.links.clear();
     state.rendered_latest = false;
     hits.add(area, Target::Messages);
     let border_style = if focused {
@@ -295,7 +301,7 @@ pub fn render(
     }
 
     // Pre-render all messages into a line buffer (single pass produces lines + ranges).
-    let (all_lines, msg_line_ranges) = build_message_lines(
+    let (all_lines, msg_line_ranges, links) = build_message_lines(
         state,
         messages_area.width as usize,
         user_name,
@@ -355,6 +361,24 @@ pub fn render(
         }
     }
 
+    state.links = links
+        .into_iter()
+        .filter_map(|mut link| {
+            if link.y < scroll || link.y >= scroll + visible_height {
+                return None;
+            }
+            link.y = messages_area.y as usize + link.y - scroll;
+            link.x += messages_area.x as usize;
+            // Reserve the final column for scroll indicators.
+            link.width = link.width.min(
+                (messages_area.right() as usize)
+                    .saturating_sub(1)
+                    .saturating_sub(link.x),
+            );
+            (link.width > 0).then_some(link)
+        })
+        .collect();
+
     // Render visible lines.
     for (row, line_idx) in (scroll..total_lines).take(visible_height).enumerate() {
         let y = messages_area.y + row as u16;
@@ -403,10 +427,11 @@ fn build_message_lines(
     width: usize,
     user_name: &str,
     current_user_id: Option<&str>,
-) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>, Vec<Link>) {
     let today = Local::now().naive_local().date();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut links = Vec::new();
 
     for (msg_idx, msg) in state.messages.iter().enumerate() {
         let start = lines.len();
@@ -420,6 +445,7 @@ fn build_message_lines(
         // Render main message card.
         render_message_card(
             &mut lines,
+            &mut links,
             msg,
             width,
             is_selected,
@@ -436,6 +462,7 @@ fn build_message_lines(
             for reply in &msg.replies {
                 render_message_card(
                     &mut lines,
+                    &mut links,
                     reply,
                     width,
                     false,
@@ -465,7 +492,7 @@ fn build_message_lines(
         ranges.push((start, lines.len()));
     }
 
-    (lines, ranges)
+    (lines, ranges, links)
 }
 
 /// Render a single message card (either top-level or reply) into the line buffer.
@@ -474,6 +501,7 @@ fn build_message_lines(
 /// alternates between two subtle background shades for visual separation.
 fn render_message_card(
     lines: &mut Vec<Line<'static>>,
+    links: &mut Vec<Link>,
     msg: &Message,
     width: usize,
     is_selected: bool,
@@ -575,8 +603,6 @@ fn render_message_card(
     ));
 
     // Content lines (word-wrapped).
-    let wrap_width = content_width;
-    let content_lines = wrap_text(&msg.content, wrap_width);
     let content_prefix = format!(
         "{}{}",
         indent_str,
@@ -586,12 +612,20 @@ fn render_message_card(
             "    " // align with sender name after selection indicator "  "
         }
     );
-    for cl in &content_lines {
-        let used = content_prefix.len() + cl.len();
+    let wrap_width = effective_width
+        .saturating_sub(content_prefix.width())
+        .saturating_sub(1);
+    for cl in hyperlinks::wrap(&msg.content, wrap_width) {
+        for mut link in cl.links {
+            link.x += left_margin + content_prefix.width();
+            link.y = lines.len();
+            links.push(link);
+        }
+        let used = content_prefix.width() + cl.text.width();
         lines.push(make_bg_line(
             vec![
                 Span::styled(content_prefix.clone(), bg_style),
-                Span::styled(cl.clone(), text_style),
+                Span::styled(cl.text, text_style),
             ],
             used,
         ));
@@ -720,38 +754,6 @@ fn format_timestamp(raw: &str, today: NaiveDate) -> String {
     }
 }
 
-/// Simple word-wrapping: split content by newlines first, then wrap long lines.
-fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return vec![];
-    }
-    let mut result = Vec::new();
-    for line in text.lines() {
-        if line.len() <= max_width {
-            result.push(line.to_string());
-        } else {
-            // Word wrap.
-            let words: Vec<&str> = line.split_whitespace().collect();
-            let mut current = String::new();
-            for word in words {
-                if current.is_empty() {
-                    current = word.to_string();
-                } else if current.len() + 1 + word.len() <= max_width {
-                    current.push(' ');
-                    current.push_str(word);
-                } else {
-                    result.push(current);
-                    current = word.to_string();
-                }
-            }
-            if !current.is_empty() {
-                result.push(current);
-            }
-        }
-    }
-    result
-}
-
 /// Derive a deterministic RGB color from a username.
 ///
 /// Hash all bytes, truncate to u8, scale to 0..359 HSV hue, convert
@@ -806,6 +808,76 @@ mod tests {
             }],
         );
         build_message_lines(&state, 100, "My Name", user).0
+    }
+
+    #[test]
+    fn links_stay_inside_cards_and_follow_viewport() {
+        let url = format!("https://example.com/{}?a=1&b=2", "long/".repeat(60));
+        let mut state = MessagesState::default();
+        state.update_messages(
+            "Chat",
+            vec![api::MessageInfo {
+                id: "1".into(),
+                sender_id: "self".into(),
+                sender: "Me".into(),
+                timestamp: "2026-09-28T10:00:00Z".into(),
+                content: url.clone(),
+                mentions: Vec::new(),
+            }],
+        );
+        let reply = state.messages[0].clone();
+        state.messages[0].replies.push(reply);
+        state.expanded_threads[0] = true;
+        for width in [24, 40, 80, 120] {
+            let (lines, _, links) = build_message_lines(&state, width, "Me", Some("self"));
+            assert!(!links.is_empty());
+            for link in links {
+                assert_eq!(link.url, url);
+                assert!(link.x + link.width < width);
+                assert!(lines[link.y].width() <= width);
+            }
+            let area = Rect::new(0, 0, width as u16, 10);
+            let mut buffer = Buffer::empty(area);
+            let mut hits = HitMap::default();
+            render(
+                area,
+                &mut buffer,
+                &mut state,
+                true,
+                "Me",
+                Some("self"),
+                &mut hits,
+            );
+            assert!(!state.links.is_empty());
+            for link in &state.links {
+                assert_eq!(link.url, url);
+                assert!(link.x + link.width < area.right() as usize);
+                assert!(link.y < area.bottom() as usize);
+            }
+            state.viewport.offset = 4;
+            state.viewport.scroll(false);
+            render(
+                area,
+                &mut buffer,
+                &mut state,
+                true,
+                "Me",
+                Some("self"),
+                &mut hits,
+            );
+            assert!(state.links.iter().all(|link| link.url == url && link.y < 9));
+        }
+        state.loading = true;
+        render(
+            Rect::new(0, 0, 40, 10),
+            &mut Buffer::empty(Rect::new(0, 0, 40, 10)),
+            &mut state,
+            true,
+            "Me",
+            None,
+            &mut HitMap::default(),
+        );
+        assert!(state.links.is_empty());
     }
 
     #[test]
