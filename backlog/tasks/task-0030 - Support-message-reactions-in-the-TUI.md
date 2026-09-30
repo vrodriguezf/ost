@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@codex'
 created_date: '2026-09-30 09:37'
-updated_date: '2026-09-30 09:46'
+updated_date: '2026-09-30 09:57'
 labels: []
 dependencies: []
 ---
@@ -19,7 +19,7 @@ Read and manage native Teams message reactions from the selected TUI message so 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [x] #1 Existing message reactions display accurate deduplicated counts and current-user ownership from supported native payload forms.
-- [x] #2 The plus key opens a keyboard reaction picker for a valid selected message, with add and remove actions that preserve unrelated reactions.
+- [x] #2 The r key opens a keyboard reaction picker for a valid selected message, with add and remove actions that preserve unrelated reactions.
 - [x] #3 Native reaction requests use the existing regional Teams API and report loading and actionable errors.
 - [x] #4 Successful reactions and background message updates refresh reactions while preserving conversation selection, draft, history position, and unread counts.
 - [x] #5 Focused tests cover parsing, HTTP request construction, picker interactions, cancellation, invalid or stale targets, and refresh behavior.
@@ -31,6 +31,8 @@ Read and manage native Teams message reactions from the selected TUI message so 
 1. Add native reaction parsing and narrowly scoped add/remove API calls.
 2. Integrate a keyboard reaction picker and state-preserving refresh through the TUI backend.
 3. Add parser, HTTP, interaction, and background refresh regression tests; document controls and run focused checks.
+
+4. Replace the reaction shortcut with plain r and synchronize help, docs, and existing interaction tests.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
@@ -41,12 +43,14 @@ Read and manage native Teams message reactions from the selected TUI message so 
 - cargo test --locked reaction: 12 passed. cargo fmt --all and git diff --check passed. Parent review, full suite, Clippy, release build, and PTY smoke checks remain; no live account writes performed.
 
 Parent review completed. Full validation passed: cargo test --locked (198 passed, 2 ignored); cargo fmt -- --check; cargo clippy --locked --all-targets (existing repository warnings); cargo build --locked --release; normal/error/panic PTY smoke checks; git diff --check. No live account mutations were used for validation.
+
+Changed the reaction shortcut from + to plain r at user request. Removed the unimplemented r reply hint and synchronized README, help, design reference, and existing interaction tests. Validation: all 12 reaction tests, formatting, whitespace checks, and Clippy passed (existing repository warnings).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Added message reactions to the TUI through the existing native Teams chat API. Messages show deduplicated counts and current-user ownership. Pressing + on a selected message opens a picker for adding common reactions or removing an existing own reaction, with keyboard navigation, cancellation, and loading/error feedback.
+Added message reactions to the TUI through the existing native Teams chat API. Messages show deduplicated counts and current-user ownership. Pressing r on a selected message opens a picker for adding common reactions or removing an existing own reaction, with keyboard navigation, cancellation, and loading/error feedback.
 
 Successful changes refresh the exact message while preserving the conversation, draft, selection, history position, and unread state. Existing push and polling updates refresh reaction counts. The picker rejects unavailable or synthetic targets, blocks duplicate submissions and mouse clicks through the overlay, and supports removing existing custom reactions. Reaction strips wrap within the message width. README and help describe the controls.
 

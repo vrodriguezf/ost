@@ -379,11 +379,8 @@ impl App {
                 self.handle_sidebar_enter(backend);
             }
             // Messages pane keys
-            KeyCode::Char('+')
-                if self.active_pane == Pane::Messages
-                    && !key_event.modifiers.intersects(
-                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                    ) =>
+            KeyCode::Char('r')
+                if self.active_pane == Pane::Messages && key_event.modifiers.is_empty() =>
             {
                 self.open_reactions();
             }

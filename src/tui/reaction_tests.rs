@@ -47,7 +47,7 @@ fn key(app: &mut App, backend: &Backend, code: KeyCode) {
 fn reaction_picker_add_remove_cancel_and_custom_ownership() {
     let (backend, mut commands) = Backend::for_test();
     let mut app = app();
-    key(&mut app, &backend, KeyCode::Char('+'));
+    key(&mut app, &backend, KeyCode::Char('r'));
     key(&mut app, &backend, KeyCode::Down);
     key(&mut app, &backend, KeyCode::Esc);
     assert!(app.reaction_picker.is_none());
@@ -56,7 +56,7 @@ fn reaction_picker_add_remove_cancel_and_custom_ownership() {
         reaction("like", &["other"]),
         reaction("custom", &["8:orgid:ME"]),
     ];
-    key(&mut app, &backend, KeyCode::Char('+'));
+    key(&mut app, &backend, KeyCode::Char('r'));
     assert_eq!(
         app.reaction_picker
             .as_ref()
@@ -83,7 +83,7 @@ fn reaction_picker_add_remove_cancel_and_custom_ownership() {
         },
         &backend,
     );
-    key(&mut app, &backend, KeyCode::Char('+'));
+    key(&mut app, &backend, KeyCode::Char('r'));
     key(&mut app, &backend, KeyCode::Enter);
     assert!(
         matches!(commands.try_recv().unwrap(), BackendCommand::ChangeReaction { key, remove: true, .. } if key == "like")
@@ -104,19 +104,23 @@ fn reaction_picker_rejects_invalid_stale_and_modified_targets() {
             4 => app.current_user_id = None,
             _ => app.active_pane = Pane::Sidebar,
         }
-        key(&mut app, &backend, KeyCode::Char('+'));
+        key(&mut app, &backend, KeyCode::Char('r'));
         assert!(app.reaction_picker.is_none());
     }
     let mut app = app();
-    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::SHIFT,
+    ] {
         app.handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('+'), modifiers)),
+            Event::Key(KeyEvent::new(KeyCode::Char('r'), modifiers)),
             &backend,
         );
         assert!(app.reaction_picker.is_none());
     }
     app.handle_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
         &backend,
     );
     assert!(app.reaction_picker.is_some());
@@ -131,7 +135,7 @@ fn reaction_result_preserves_old_history_draft_selection_and_unread() {
     let (backend, mut commands) = Backend::for_test();
     let mut app = app();
     let unread = app.unread.badge("chat");
-    key(&mut app, &backend, KeyCode::Char('+'));
+    key(&mut app, &backend, KeyCode::Char('r'));
     key(&mut app, &backend, KeyCode::Enter);
     commands.try_recv().unwrap();
     app.handle_backend_response(
@@ -167,7 +171,7 @@ fn reaction_result_preserves_old_history_draft_selection_and_unread() {
 fn reaction_errors_unlock_picker_and_pending_escape_does_not_resend() {
     let (backend, mut commands) = Backend::for_test();
     let mut app = app();
-    key(&mut app, &backend, KeyCode::Char('+'));
+    key(&mut app, &backend, KeyCode::Char('r'));
     key(&mut app, &backend, KeyCode::Enter);
     commands.try_recv().unwrap();
     app.handle_backend_response(
@@ -190,7 +194,7 @@ fn reaction_errors_unlock_picker_and_pending_escape_does_not_resend() {
     key(&mut app, &backend, KeyCode::Enter);
     commands.try_recv().unwrap();
     key(&mut app, &backend, KeyCode::Esc);
-    key(&mut app, &backend, KeyCode::Char('+'));
+    key(&mut app, &backend, KeyCode::Char('r'));
     assert!(app.reaction_picker.is_none());
     assert!(commands.try_recv().is_err());
     app.handle_backend_response(
@@ -206,7 +210,7 @@ fn reaction_errors_unlock_picker_and_pending_escape_does_not_resend() {
         .as_ref()
         .unwrap()
         .contains("updated, but refresh failed"));
-    key(&mut app, &backend, KeyCode::Char('+'));
+    key(&mut app, &backend, KeyCode::Char('r'));
     key(&mut app, &backend, KeyCode::Enter);
     commands.try_recv().unwrap();
     app.handle_backend_response(BackendResponse::ClientError("expired".into()), &backend);
@@ -224,7 +228,7 @@ fn reaction_modal_blocks_mouse_and_read_acknowledgement_and_renders_ownership() 
     app.rendered_chat_id = Some("chat".into());
     app.terminal_focused = true;
     assert!(app.is_reading_latest("chat"));
-    key(&mut app, &backend, KeyCode::Char('+'));
+    key(&mut app, &backend, KeyCode::Char('r'));
     assert!(!app.is_reading_latest("chat"));
     let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
