@@ -67,6 +67,8 @@ def check_session(executable, mode):
         target = b"https://example.com/" + b"long/" * 30 + b"?a=1&b=2"
         assert b"\x1b]8;;" + target + b"\x1b\\" in output, "full hyperlink target missing"
         assert b"\x1b]8;;\x1b\\" in output, "hyperlink was not closed"
+        assert b"Quoted colleague" in output, "quoted author missing"
+        assert b"Reply below the quoted link" in output, "reply text missing"
         assert b"\x1b[?1049l" in output, "alternate screen was not restored"
         assert termios.tcgetattr(slave) == before, "terminal attributes were not restored"
         if mode == "panic":

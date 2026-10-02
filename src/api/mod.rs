@@ -2,6 +2,7 @@
 
 mod chat;
 pub mod client;
+mod content;
 mod graph;
 mod me;
 pub(crate) mod names;
@@ -14,6 +15,7 @@ use anyhow::Result;
 // Re-export data types for TUI integration
 pub(crate) use chat::{is_activity_stream, list_recent_data, message_sort_key};
 pub use chat::{ChatInfo, ChatNameSource, MessageInfo};
+pub use content::MessageBlock;
 pub use me::UserInfo;
 pub use presence::PresenceInfo;
 pub use reactions::{change_reaction, read_reactions, Reaction};

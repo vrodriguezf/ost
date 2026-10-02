@@ -641,6 +641,7 @@ mod tests {
             sender: "Other".into(),
             timestamp: timestamp.into(),
             content: "Hello".into(),
+            content_blocks: Vec::new(),
             reactions: Vec::new(),
             mentions: vec![],
         }

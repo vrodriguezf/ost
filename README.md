@@ -117,6 +117,13 @@ Keyboard navigation remains available. For terminal text selection, use your ter
 
 Long message URLs wrap within the pane and retain their full destination through terminal hyperlinks (OSC 8). Use your terminal's link-opening shortcut, such as Ctrl+Shift+click in Kitty. Terminals or multiplexers without OSC 8 support may still detect only the visible URL fragment.
 
+Quoted replies show the original author and muted quoted text beside a slim accent
+bar, with the reply on its own line below. Long quotes wrap within the message;
+quoted links retain their full destination. Missing or placeholder authors resolve
+from the quoted user's identity and known conversation participants when available;
+otherwise they are labeled **Quoted message**. Clicking the quote selects the
+message containing the reply.
+
 To react, focus the messages pane, select a message, and press **r**. Use **Up/Down**
 or **j/k** to choose a reaction, **Enter** to apply it, and **Esc** to close the
 picker. Reactions you already added show **Remove**; selecting one removes only

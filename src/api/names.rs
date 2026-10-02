@@ -71,7 +71,7 @@ fn participant_label(members: &[String], profiles: &[Profile], user: &str) -> Op
 
 /// A native direct-chat ID contains both AAD object IDs. Only trust it when
 /// both parts are UUIDs and one matches the signed-in user.
-fn direct_chat_peer(chat: &str, user: &str) -> Option<String> {
+pub(crate) fn direct_chat_peer(chat: &str, user: &str) -> Option<String> {
     let pair = chat.strip_prefix("19:")?.strip_suffix("@unq.gbl.spaces")?;
     let (left, right) = pair.split_once('_')?;
     uuid::Uuid::parse_str(left).ok()?;
@@ -276,6 +276,7 @@ mod tests {
             sender: name.into(),
             timestamp: String::new(),
             content: String::new(),
+            content_blocks: Vec::new(),
             reactions: Vec::new(),
             mentions: Vec::new(),
         };
