@@ -12,6 +12,7 @@ fn message(id: &str) -> api::MessageInfo {
         timestamp: "2026-09-18T10:00:00Z".into(),
         content: format!("Message {id}"),
         mentions: vec![],
+        content_blocks: Vec::new(),
         reactions: vec![],
     }
 }

@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::client::TeamsClient;
+use super::content::parse_message_content;
 
 // -- Response types for the native chat API --
 
@@ -62,28 +63,6 @@ struct NativeMessage {
 #[derive(Debug, Deserialize)]
 struct MessagesResponse {
     messages: Option<Vec<NativeMessage>>,
-}
-
-/// Strip HTML tags from content for CLI display.
-fn strip_html(html: &str) -> String {
-    let mut result = String::with_capacity(html.len());
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => result.push(ch),
-            _ => {}
-        }
-    }
-    // Decode common HTML entities
-    result
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
 }
 
 /// Display name for a conversation.
@@ -236,6 +215,8 @@ pub struct MessageInfo {
     pub sender: String,
     pub timestamp: String,
     pub content: String,
+    /// Ordered text and quote sections. `content` remains the readable CLI form.
+    pub content_blocks: Vec<super::MessageBlock>,
     pub mentions: Vec<String>,
     pub reactions: Vec<super::Reaction>,
 }
@@ -387,7 +368,7 @@ fn conversation_infos(conversations: &[Conversation], channels: bool) -> Vec<Cha
                 .map(String::from);
             let sender = msg.im_display_name.clone();
             let preview = msg.content.as_deref().map(|c| {
-                let text = strip_html(c);
+                let text = parse_message_content(c, message_is_html(msg)).plain_text;
                 if text.len() > 80 {
                     let end = text
                         .char_indices()
@@ -468,9 +449,9 @@ pub async fn read_messages_data(
             .unwrap_or("")
             .to_string();
         let content = msg.content.as_deref().unwrap_or("");
-        let text = strip_html(content);
+        let parsed = parse_message_content(content, message_is_html(msg));
 
-        if text.trim().is_empty() {
+        if parsed.plain_text.trim().is_empty() {
             continue;
         }
 
@@ -479,7 +460,8 @@ pub async fn read_messages_data(
             sender_id: msg.from.clone().unwrap_or_default(),
             sender,
             timestamp: time,
-            content: text.trim().to_string(),
+            content: parsed.plain_text,
+            content_blocks: parsed.blocks,
             mentions: explicit_mentions(msg.properties.as_ref()),
             reactions: super::reactions::parse_reactions(msg.properties.as_ref()),
         });
@@ -493,6 +475,13 @@ pub async fn read_messages_data(
     let mut seen = std::collections::HashSet::new();
     result.retain(|message| message.id.is_empty() || seen.insert(message.id.clone()));
     Ok(result)
+}
+
+fn message_is_html(message: &NativeMessage) -> bool {
+    message
+        .messagetype
+        .as_deref()
+        .is_some_and(|kind| kind.contains("RichText"))
 }
 
 /// Chronological key with a numeric ID tie-breaker (service IDs are milliseconds).
@@ -534,6 +523,52 @@ fn explicit_mentions(properties: Option<&serde_json::Value>) -> Vec<String> {
 #[cfg(test)]
 mod live_message_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_message_response_preserves_reply_blocks_and_plain_text() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = serde_json::json!({"messages": [
+            {"id":"3", "messagetype":"RichText/Html", "content":"<blockquote><span itemprop='name'>Alice</span></blockquote>"},
+            {"id":"2", "messagetype":"RichText/Html", "content":"<blockquote><strong itemprop='mri'>Alice</strong><p itemprop='preview'>Original</p></blockquote><p>Response</p>"},
+            {"id":"1", "messagetype":"Text", "content":"1 < 2 and <value> &amp;"}
+        ]}).to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TeamsClient::for_test(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let messages = read_messages_data(&client, "test-chat", 10).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "1 < 2 and <value> &amp;");
+        assert_eq!(
+            messages[1].content_blocks,
+            vec![
+                super::super::MessageBlock::Quote {
+                    author: Some("Alice".into()),
+                    text: "Original".into()
+                },
+                super::super::MessageBlock::Text("Response".into())
+            ]
+        );
+        assert_eq!(messages[1].content, "> Alice\n> Original\n\nResponse");
+        assert_eq!(messages[2].content, "> Alice");
+    }
+
     #[test]
     fn conversation_names_distinguish_titles_from_sender_hints_and_missing_metadata() {
         let conversation = |value| serde_json::from_value::<Conversation>(value).unwrap();

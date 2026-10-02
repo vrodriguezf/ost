@@ -26,6 +26,7 @@ fn history(message: &IncomingMessage) -> MessageInfo {
         sender: message.sender.clone(),
         timestamp: message.timestamp.clone(),
         content: message.content.clone(),
+        content_blocks: Vec::new(),
         reactions: Vec::new(),
         mentions: message.mentions.clone(),
     }

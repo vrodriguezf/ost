@@ -96,3 +96,22 @@ Example - Compose focused:
 ╔════════════════════════════════════════╗
 ║ Type a message... █                    ║
 ╚════════════════════════════════════════╝
+
+
+QUOTED REPLIES:
+────────────────
+Quoted content stays inside its message card, using a slim accent bar and muted
+text to distinguish it from the reply. The quoted author's name appears separately;
+when unavailable, the label is "Quoted message". Text and links wrap within the
+card, and wrapped links retain their complete terminal hyperlink destination.
+
+  > Jorge Martin la Pena                                      12:34
+      │ ↪ Original author
+      │ han mejorado la infra
+
+      En el devday presumieron de que habían mejorado aún más
+      y tenían la mejor API.
+
+The card keeps its usual sender color, own-message alignment, selection background,
+and mouse target. Clicking any quote row selects the containing message. Refreshes
+preserve the compose draft and reading position, including when quote height changes.

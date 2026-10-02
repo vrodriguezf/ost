@@ -482,6 +482,7 @@ mod tests {
             sender: event.sender,
             timestamp: event.timestamp,
             content: event.content,
+            content_blocks: Vec::new(),
             reactions: Vec::new(),
             mentions: vec![],
         }

@@ -141,6 +141,7 @@ fn message(content: &str) -> Message {
         sender: "Sender".into(),
         timestamp: "12:34".into(),
         content: content.into(),
+        content_blocks: Vec::new(),
         reactions: vec![],
         reply_count: 0,
         replies: vec![],
@@ -310,6 +311,32 @@ fn wrapped_messages_replies_and_blank_separator_have_correct_click_targets() {
     let (x, y) = h.text_position("Reply body");
     h.click(x, y + 1); // Blank separator after the first thread.
     assert_eq!(h.app.messages.selected, 1);
+}
+
+#[test]
+fn quoted_author_and_wrapped_quote_select_the_containing_message() {
+    let mut h = Harness::new();
+    h.add_messages(3);
+    h.app.messages.messages[1].content_blocks = vec![
+        api::MessageBlock::Quote {
+            author: Some("Original author".into()),
+            text: format!("{}quote tail", "quoted words ".repeat(8)),
+        },
+        api::MessageBlock::Text("The actual reply".into()),
+    ];
+    h.app.messages.selected = 2;
+    h.draw();
+
+    h.click_text("Original author");
+    assert_eq!(h.app.messages.selected, 1);
+    assert_eq!(h.app.active_pane, Pane::Messages);
+    h.text_position("The actual reply");
+
+    h.key(KeyCode::Down);
+    assert_eq!(h.app.messages.selected, 2);
+    h.click_text("quote tail");
+    assert_eq!(h.app.messages.selected, 1);
+    assert!(h.commands.try_recv().is_err());
 }
 
 #[test]
@@ -563,6 +590,13 @@ fn terminal_session_fixture() {
         h.add_messages(20);
         h.app.messages.messages[0].content =
             format!("https://example.com/{}?a=1&b=2", "long/".repeat(30));
+        h.app.messages.messages[0].content_blocks = vec![
+            api::MessageBlock::Quote {
+                author: Some("Quoted colleague".into()),
+                text: h.app.messages.messages[0].content.clone(),
+            },
+            api::MessageBlock::Text("Reply below the quoted link".into()),
+        ];
         let mut painter = super::super::hyperlinks::Painter::default();
         while !h.app.should_exit {
             draw_with_links(&mut terminal, &mut h.app, &mut painter)?;
@@ -586,6 +620,89 @@ fn terminal_session_fixture() {
     }
 }
 
+/// Exports the actual styled terminal cells for an offline visual review.
+#[test]
+#[ignore = "set OST_REPLY_PREVIEW to an output JSON path for visual review"]
+fn quoted_reply_visual_preview_fixture() {
+    let output = std::env::var("OST_REPLY_PREVIEW").expect("set preview output path");
+    let mut h = Harness::new();
+    h.terminal.backend_mut().resize(120, 38);
+    h.terminal.resize(Rect::new(0, 0, 120, 38)).unwrap();
+    h.add_team();
+    h.app.sidebar.teams[0].name = "Engineering".into();
+    h.app.sidebar.teams[0].channels[0].name = "general".into();
+    h.app.sidebar.teams_expanded = true;
+    h.add_chats(1);
+    h.app.sidebar.chats[0].name = "Project chat".into();
+    h.app.sidebar.chats[0].is_group = true;
+    h.app.current_chat_id = Some("chat-0".into());
+    h.app.current_user_id = Some("8:orgid:me".into());
+    h.app.connection_state = "Live".into();
+    h.app.is_online = true;
+    h.app.active_pane = Pane::Messages;
+
+    let mut original = live_message(
+        1,
+        "Han mejorado la infra. La nueva API parece bastante más rápida.",
+    );
+    original.sender = "Ana".into();
+    original.sender_id = "8:orgid:ana".into();
+    let reply = "En el devday presumieron de que habían mejorado aún más y tenían la mejor API.";
+    let mut quoted = live_message(2, &format!("Ana\nHan mejorado la infra.\n{reply}"));
+    quoted.sender = "Jorge Martin la Pena".into();
+    quoted.sender_id = "8:orgid:jorge".into();
+    quoted.content_blocks = vec![
+        api::MessageBlock::Quote {
+            author: Some("Ana".into()),
+            text: "Han mejorado la infra.".into(),
+        },
+        api::MessageBlock::Text(reply.into()),
+    ];
+    let mut own = live_message(3, "Jorge Martin la Pena\nEn el devday presumieron de que habían mejorado aún más y tenían la mejor API.\nPodemos probarla esta semana y comparar los resultados.");
+    own.sender = "Me".into();
+    own.sender_id = "8:orgid:me".into();
+    own.content_blocks = vec![
+        api::MessageBlock::Quote {
+            author: Some("Jorge Martin la Pena".into()),
+            text: reply.into(),
+        },
+        api::MessageBlock::Text("Podemos probarla esta semana y comparar los resultados.".into()),
+    ];
+    for (message, minute) in [(&mut original, "31"), (&mut quoted, "34"), (&mut own, "36")] {
+        message.timestamp = format!("{}T12:{minute}:00Z", chrono::Utc::now().date_naive());
+    }
+    h.app
+        .messages
+        .update_messages("Project chat", vec![original, quoted, own]);
+    h.app.messages.selected = 1;
+    h.app.messages.viewport.follow_bottom = false;
+    h.app.messages.viewport.follow_selection = true;
+    h.draw();
+
+    let buffer = h.terminal.backend().buffer();
+    let cells: Vec<_> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| {
+                    let cell = &buffer[(x, y)];
+                    serde_json::json!({
+                        "symbol": cell.symbol(),
+                        "fg": format!("{:?}", cell.fg),
+                        "bg": format!("{:?}", cell.bg),
+                        "modifier": format!("{:?}", cell.modifier),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let preview = serde_json::json!({
+        "width": buffer.area.width,
+        "height": buffer.area.height,
+        "cells": cells,
+    });
+    std::fs::write(output, serde_json::to_vec(&preview).unwrap()).unwrap();
+}
+
 fn live_message(id: u64, content: &str) -> api::MessageInfo {
     api::MessageInfo {
         id: id.to_string(),
@@ -593,6 +710,7 @@ fn live_message(id: u64, content: &str) -> api::MessageInfo {
         sender: "Sender".into(),
         timestamp: "2026-09-18T10:00:00Z".into(),
         content: content.into(),
+        content_blocks: Vec::new(),
         reactions: Vec::new(),
         mentions: vec![],
     }
@@ -691,6 +809,72 @@ fn background_history_preserves_wheel_anchor_and_follows_latest_when_selected() 
     h.draw();
     assert_eq!(h.app.messages.messages[h.app.messages.selected].id, "31");
     h.text_position("latest message");
+}
+
+#[test]
+fn quote_refresh_preserves_draft_selection_and_visible_history() {
+    let mut h = Harness::new();
+    h.app.current_chat_id = Some("chat".into());
+    let mut quoted = live_message(1, "Old quote\nThe actual reply");
+    quoted.content_blocks = vec![
+        api::MessageBlock::Quote {
+            author: Some("Original author".into()),
+            text: "Old quote".into(),
+        },
+        api::MessageBlock::Text("The actual reply".into()),
+    ];
+    let mut history: Vec<_> = (2..30)
+        .map(|id| live_message(id, &format!("Message {id}")))
+        .collect();
+    history.insert(0, quoted.clone());
+    live_history(&mut h, "chat", history);
+    h.app.messages.selected = 14;
+    h.app.messages.viewport.follow_bottom = false;
+    h.app.messages.viewport.follow_selection = true;
+    h.app.active_pane = Pane::Compose;
+    h.app.compose.input = "An unfinished reply".into();
+    h.app.compose.cursor_pos = 4;
+    h.draw();
+    h.mouse(MouseEventKind::ScrollUp, 35, 8);
+    let first_visible = row_text(h.terminal.backend().buffer(), 3);
+    let selected_id = h.app.messages.messages[h.app.messages.selected].id.clone();
+    let previous_offset = h.app.messages.viewport.offset;
+    let updated_quote = format!("Updated quoted text\n{}", "extra quote line\n".repeat(12));
+    quoted.content = format!("{updated_quote}\nThe actual reply");
+    quoted.content_blocks[0] = api::MessageBlock::Quote {
+        author: Some("Original author".into()),
+        text: updated_quote,
+    };
+    live_history(&mut h, "chat", vec![quoted.clone()]);
+    h.draw();
+
+    assert_eq!(
+        h.app.messages.messages[0].content_blocks,
+        quoted.content_blocks
+    );
+    assert_eq!(
+        h.app.messages.messages[h.app.messages.selected].id,
+        selected_id
+    );
+    assert_eq!(row_text(h.terminal.backend().buffer(), 3), first_visible);
+    assert!(h.app.messages.viewport.offset > previous_offset);
+    assert_eq!(h.app.compose.input, "An unfinished reply");
+    assert_eq!(h.app.compose.cursor_pos, 4);
+    assert_eq!(h.app.active_pane, Pane::Compose);
+
+    for query in ["Updated quoted text", "The actual reply"] {
+        h.app.search.query = query.into();
+        h.app.search.update_results(&h.app.sidebar, &h.app.messages);
+        assert!(matches!(
+            h.app.search.selected_result().map(|result| &result.kind),
+            Some(SearchResultKind::Message(0))
+        ));
+    }
+
+    h.app.messages.selected = 0;
+    h.app.messages.viewport.follow_selection = true;
+    h.draw();
+    h.text_position("Updated quoted text");
 }
 
 #[test]

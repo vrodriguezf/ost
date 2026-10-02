@@ -42,6 +42,8 @@ pub struct Message {
     pub timestamp: String,
     /// Message body lines.
     pub content: String,
+    /// Ordered text and quoted reply context from the native message.
+    pub content_blocks: Vec<api::MessageBlock>,
     /// Reactions below the message.
     pub reactions: Vec<api::Reaction>,
     /// Number of thread replies (0 = no thread).
@@ -133,6 +135,7 @@ impl MessagesState {
                 existing.sender = message.sender;
                 existing.timestamp = message.timestamp;
                 existing.content = message.content;
+                existing.content_blocks = message.content_blocks;
                 existing.reactions = message.reactions;
                 existing.native_id = native_id;
             } else {
@@ -149,6 +152,7 @@ impl MessagesState {
                         sender: message.sender,
                         timestamp: message.timestamp,
                         content: message.content,
+                        content_blocks: message.content_blocks,
                         reactions: message.reactions,
                         reply_count: 0,
                         replies: Vec::new(),
@@ -579,7 +583,6 @@ fn render_message_card(
         .add_modifier(Modifier::BOLD);
 
     let timestamp_style = Style::default().fg(Color::DarkGray).bg(bg);
-    let text_style = Style::default().fg(Color::White).bg(bg);
     let bg_style = Style::default().bg(bg);
 
     let formatted_ts = format_timestamp(&msg.timestamp, today);
@@ -599,14 +602,26 @@ fn render_message_card(
 
     // Sender + timestamp line.
     let prefix = format!("{}{}{}", indent_str, reply_prefix, selection_indicator);
-    let ts_gap = content_width
-        .saturating_sub(sender.len())
-        .saturating_sub(formatted_ts.len());
-    let used = prefix.len() + sender.len() + ts_gap + formatted_ts.len();
+    let header_width = effective_width
+        .saturating_sub(prefix.width())
+        .saturating_sub(1);
+    let formatted_ts = if formatted_ts.width() + 4 <= header_width {
+        formatted_ts
+    } else {
+        String::new()
+    };
+    let sender_label = truncate_label(
+        sender,
+        header_width.saturating_sub(formatted_ts.width() + usize::from(!formatted_ts.is_empty())),
+    );
+    let ts_gap = header_width
+        .saturating_sub(sender_label.width())
+        .saturating_sub(formatted_ts.width());
+    let used = prefix.width() + sender_label.width() + ts_gap + formatted_ts.width();
     lines.push(make_bg_line(
         vec![
             Span::styled(prefix.clone(), bg_style),
-            Span::styled(sender.to_owned(), sender_style),
+            Span::styled(sender_label, sender_style),
             Span::styled(" ".repeat(ts_gap), bg_style),
             Span::styled(formatted_ts, timestamp_style),
         ],
@@ -623,23 +638,34 @@ fn render_message_card(
             "    " // align with sender name after selection indicator "  "
         }
     );
-    let wrap_width = effective_width
-        .saturating_sub(content_prefix.width())
-        .saturating_sub(1);
-    for cl in hyperlinks::wrap(&msg.content, wrap_width) {
-        for mut link in cl.links {
-            link.x += left_margin + content_prefix.width();
-            link.y = lines.len();
-            links.push(link);
+    let mut body = MessageBodyRenderer {
+        lines,
+        links,
+        width: effective_width,
+        left_margin,
+        prefix: &content_prefix,
+        background: bg,
+    };
+    if msg.content_blocks.is_empty() {
+        body.text(&msg.content);
+    } else {
+        let mut previous_quote = false;
+        let mut has_content = false;
+        for block in &msg.content_blocks {
+            let is_quote = matches!(block, api::MessageBlock::Quote { .. });
+            if matches!(block, api::MessageBlock::Text(text) if text.is_empty()) {
+                continue;
+            }
+            if has_content && (previous_quote || is_quote) {
+                body.blank();
+            }
+            match block {
+                api::MessageBlock::Text(text) => body.text(text),
+                api::MessageBlock::Quote { author, text } => body.quote(author.as_deref(), text),
+            }
+            previous_quote = is_quote;
+            has_content = true;
         }
-        let used = content_prefix.width() + cl.text.width();
-        lines.push(make_bg_line(
-            vec![
-                Span::styled(content_prefix.clone(), bg_style),
-                Span::styled(cl.text, text_style),
-            ],
-            used,
-        ));
     }
 
     // Attachments.
@@ -693,6 +719,109 @@ fn render_message_card(
         spans.insert(0, Span::styled(content_prefix.clone(), bg_style));
         lines.push(make_bg_line(spans, used));
     }
+}
+
+/// Draw body rows in the same card coordinate system as names and reactions.
+/// Quote backgrounds start at the body inset; card selection stays visible.
+struct MessageBodyRenderer<'a> {
+    lines: &'a mut Vec<Line<'static>>,
+    links: &'a mut Vec<Link>,
+    width: usize,
+    left_margin: usize,
+    prefix: &'a str,
+    background: Color,
+}
+
+impl MessageBodyRenderer<'_> {
+    fn blank(&mut self) {
+        let mut spans = vec![Span::raw(" ".repeat(self.left_margin))];
+        spans.push(Span::styled(
+            " ".repeat(self.width),
+            Style::default().bg(self.background),
+        ));
+        self.lines.push(Line::from(spans));
+    }
+
+    fn text(&mut self, text: &str) {
+        self.wrapped(
+            text,
+            None,
+            Style::default().fg(Color::White).bg(self.background),
+        );
+    }
+
+    fn quote(&mut self, author: Option<&str>, text: &str) {
+        let author = author.map(str::trim).filter(|name| !name.is_empty());
+        let accent = author
+            .map(username_to_color)
+            .unwrap_or(Color::Rgb(135, 145, 170));
+        let quote_bg = match self.background {
+            Color::Rgb(r, g, b) => Color::Rgb(r - r / 5, g - g / 5, b - b / 5),
+            color => color,
+        };
+        let rail = Style::default().fg(accent).bg(quote_bg);
+        let heading = author.map_or_else(|| "↪ Quoted message".into(), |name| format!("↪ {name}"));
+        self.wrapped(
+            &heading,
+            Some(rail),
+            Style::default().fg(accent).bg(quote_bg),
+        );
+        self.wrapped(
+            text,
+            Some(rail),
+            Style::default().fg(Color::Rgb(180, 184, 198)).bg(quote_bg),
+        );
+    }
+
+    fn wrapped(&mut self, text: &str, rail: Option<Style>, style: Style) {
+        let card_style = Style::default().bg(self.background);
+        let rail_width = if rail.is_some() { 2 } else { 0 };
+        let inset = self.prefix.width() + rail_width;
+        let wrap_width = self.width.saturating_sub(inset).saturating_sub(1);
+        for row in hyperlinks::wrap(text, wrap_width) {
+            for mut link in row.links {
+                link.x += self.left_margin + inset;
+                link.y = self.lines.len();
+                self.links.push(link);
+            }
+            let padding = wrap_width.saturating_sub(row.text.width());
+            let mut spans = Vec::new();
+            if self.left_margin > 0 {
+                spans.push(Span::raw(" ".repeat(self.left_margin)));
+            }
+            spans.push(Span::styled(self.prefix.to_string(), card_style));
+            if let Some(rail) = rail {
+                spans.push(Span::styled("│ ", rail));
+            }
+            spans.push(Span::styled(row.text, style));
+            spans.push(Span::styled(
+                " ".repeat(padding),
+                Style::default().bg(style.bg.unwrap_or(self.background)),
+            ));
+            spans.push(Span::styled(" ", card_style));
+            self.lines.push(Line::from(spans));
+        }
+    }
+}
+
+/// Keep header labels within a card without splitting a Unicode grapheme.
+fn truncate_label(text: &str, width: usize) -> String {
+    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    if clean.width() <= width {
+        return clean;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    for grapheme in clean.graphemes(true) {
+        if result.width() + grapheme.width() >= width {
+            break;
+        }
+        result.push_str(grapheme);
+    }
+    result.push('…');
+    result
 }
 
 /// Keep normal reaction tokens together; split unusually long keys by grapheme.
@@ -846,6 +975,200 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color {
 mod tests {
     use super::*;
 
+    fn quoted_message(author: Option<&str>, quote: &str, response: &str) -> MessagesState {
+        let mut state = MessagesState::default();
+        state.update_messages(
+            "Project chat",
+            vec![api::MessageInfo {
+                id: "1".into(),
+                sender_id: "other".into(),
+                sender: "Jorge Martin la Pena".into(),
+                timestamp: "2026-10-02T10:34:00Z".into(),
+                content: "Plain search preview; never duplicate in the card".into(),
+                content_blocks: vec![
+                    api::MessageBlock::Quote {
+                        author: author.map(str::to_string),
+                        text: quote.into(),
+                    },
+                    api::MessageBlock::Text(response.into()),
+                ],
+                mentions: vec![],
+                reactions: vec![],
+            }],
+        );
+        state
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn quoted_reply_separates_context_and_response_with_integrated_styles() {
+        let state = quoted_message(
+            Some("Ana"),
+            "han mejorado la infra",
+            "En el devday presumieron",
+        );
+        let (lines, ranges, _) = build_message_lines(&state, 80, "Me", Some("me"));
+        let text: Vec<_> = lines.iter().map(line_text).collect();
+        assert!(text[0].contains("> Jorge Martin la Pena"));
+        assert_eq!(text[1].trim(), "│ ↪ Ana");
+        assert_eq!(text[2].trim(), "│ han mejorado la infra");
+        assert!(text[3].trim().is_empty());
+        assert_eq!(text[4].trim(), "En el devday presumieron");
+        assert_eq!(ranges, vec![(0, lines.len())]);
+        assert!(!text.join("\n").contains("Plain search preview"));
+
+        let name = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("↪ Ana"))
+            .unwrap();
+        let quote = lines[2]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("han mejorado"))
+            .unwrap();
+        let response = lines[4]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("En el devday"))
+            .unwrap();
+        assert_eq!(name.style.fg, Some(username_to_color("Ana")));
+        assert_ne!(quote.style.fg, response.style.fg);
+        assert_ne!(quote.style.bg, response.style.bg);
+        assert_eq!(response.style.fg, Some(Color::White));
+        assert_eq!(response.style.bg, Some(Color::Rgb(55, 55, 70)));
+    }
+
+    #[test]
+    fn quoted_reply_fallback_and_multiple_blocks_keep_content_order() {
+        let mut state = quoted_message(None, "Original text", "Response");
+        state.messages[0]
+            .content_blocks
+            .insert(0, api::MessageBlock::Text("Before".into()));
+        state.messages[0]
+            .content_blocks
+            .push(api::MessageBlock::Quote {
+                author: Some("   ".into()),
+                text: "Another quote".into(),
+            });
+        let lines = build_message_lines(&state, 80, "Me", None).0;
+        let text: Vec<_> = lines
+            .iter()
+            .map(|line| line_text(line).trim().to_string())
+            .collect();
+        assert_eq!(
+            &text[1..],
+            [
+                "Before",
+                "",
+                "│ ↪ Quoted message",
+                "│ Original text",
+                "",
+                "Response",
+                "",
+                "│ ↪ Quoted message",
+                "│ Another quote",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn quotes_wrap_unicode_and_full_url_targets_inside_incoming_own_and_thread_cards() {
+        let url = format!("https://example.com/{}?a=1&b=2", "long/".repeat(20));
+        let author = "李明 — Ana 👩🏽‍💻 e\u{301}".repeat(4);
+        for is_own in [false, true] {
+            let mut state = quoted_message(
+                Some(&author),
+                &format!("primera línea\n{url}"),
+                "Respuesta 界 👩🏽‍💻",
+            );
+            state.messages[0].sender_id = if is_own { "me" } else { "other" }.into();
+            let reply = state.messages[0].clone();
+            state.messages[0].replies = vec![reply];
+            for width in [24, 40, 80, 120] {
+                let (lines, _, links) = build_message_lines(&state, width, "Me", Some("me"));
+                assert!(
+                    lines.iter().all(|line| line.width() <= width),
+                    "width {width}"
+                );
+                assert!(!links.is_empty());
+                for link in &links {
+                    assert_eq!(link.url, url);
+                    assert!(link.x + link.width < width);
+                    let text = line_text(&lines[link.y]);
+                    assert!(text.contains("│ "));
+                    assert!(text.chars().take(link.x).collect::<String>().contains("│ "));
+                }
+                let text: String = lines
+                    .iter()
+                    .flat_map(|line| line.spans.iter())
+                    .filter(|s| s.style.fg == Some(username_to_color(&author)))
+                    .filter(|s| s.content != "│ ")
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                assert!(text.contains(&author), "author lost at width {width}");
+                assert!(lines
+                    .iter()
+                    .any(|line| line_text(line).contains("Respuesta")));
+                if is_own && width >= 80 {
+                    assert_eq!(lines[1].spans[0].content, " ".repeat(width / 4));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quote_links_follow_scrolling_resizing_and_message_refresh() {
+        let url = format!("https://example.com/{}", "wrap/".repeat(30));
+        let mut state = quoted_message(Some("Ana"), &url, "Response");
+        for width in [80, 24, 50] {
+            let area = Rect::new(5, 3, width, 10);
+            let mut buffer = Buffer::empty(area);
+            state.viewport.offset = 2;
+            state.viewport.scroll(false);
+            render(
+                area,
+                &mut buffer,
+                &mut state,
+                true,
+                "Me",
+                None,
+                &mut HitMap::default(),
+            );
+            assert!(!state.links.is_empty());
+            for link in &state.links {
+                assert_eq!(link.url, url);
+                assert!(link.x >= area.x as usize + 6);
+                assert!(link.x + link.width < area.right() as usize);
+                assert!(link.y >= area.y as usize && link.y < area.bottom() as usize);
+            }
+        }
+        let replacement = api::MessageInfo {
+            id: "1".into(),
+            sender_id: "other".into(),
+            sender: "Jorge".into(),
+            timestamp: "2026-10-02T10:34:00Z".into(),
+            content: "Edited reply".into(),
+            content_blocks: vec![api::MessageBlock::Text("Edited reply".into())],
+            mentions: vec![],
+            reactions: vec![],
+        };
+        state.update_messages("Project chat", vec![replacement]);
+        let (lines, _, links) = build_message_lines(&state, 80, "Me", None);
+        assert!(links.is_empty());
+        assert!(lines
+            .iter()
+            .any(|line| line_text(line).contains("Edited reply")));
+        assert!(!lines.iter().any(|line| line_text(line).contains("│")));
+    }
+
     #[test]
     fn reaction_strip_wraps_all_counts_and_long_unicode_labels() {
         let mut state = MessagesState::default();
@@ -857,6 +1180,7 @@ mod tests {
                 sender: "Other".into(),
                 timestamp: "".into(),
                 content: "Hello".into(),
+                content_blocks: Vec::new(),
                 mentions: vec![],
                 reactions: [
                     "like",
@@ -911,6 +1235,7 @@ mod tests {
             sender: "Other".into(),
             timestamp: "".into(),
             content: "Hello".into(),
+            content_blocks: Vec::new(),
             mentions: vec![],
             reactions: vec![api::Reaction {
                 key: "like".into(),
@@ -952,6 +1277,7 @@ mod tests {
                 sender: sender.into(),
                 timestamp: "2026-09-18T12:00:00Z".into(),
                 content: "A new message".into(),
+                content_blocks: Vec::new(),
                 reactions: Vec::new(),
                 mentions: Vec::new(),
             }],
@@ -971,6 +1297,7 @@ mod tests {
                 sender: "Me".into(),
                 timestamp: "2026-09-28T10:00:00Z".into(),
                 content: url.clone(),
+                content_blocks: Vec::new(),
                 mentions: Vec::new(),
                 reactions: Vec::new(),
             }],

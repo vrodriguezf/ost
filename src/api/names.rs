@@ -276,6 +276,7 @@ mod tests {
             sender: name.into(),
             timestamp: String::new(),
             content: String::new(),
+            content_blocks: Vec::new(),
             reactions: Vec::new(),
             mentions: Vec::new(),
         };
