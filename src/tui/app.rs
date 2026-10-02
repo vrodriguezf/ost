@@ -19,6 +19,7 @@ use super::log_capture::LogBuffer;
 use super::messages::MessagesState;
 use super::mouse::{is_actionable, HitMap, Target, WHEEL_LINES};
 use super::notifications::{NotificationContext, NotificationPolicy, NotificationService};
+use super::reactions::ReactionPicker;
 use super::search::{SearchResultKind, SearchState};
 use super::sidebar::SidebarState;
 use super::ui;
@@ -77,6 +78,8 @@ pub struct App {
     pub show_help: bool,
     /// Global search overlay state
     pub search: SearchState,
+    pub reaction_picker: Option<ReactionPicker>,
+    pending_reaction: Option<(String, String)>,
     /// The chat/channel ID currently being viewed.
     pub current_chat_id: Option<String>,
     /// Status message shown in the status bar (errors, info).
@@ -119,6 +122,8 @@ impl App {
             compose: ComposeState::default(),
             show_help: false,
             search: SearchState::default(),
+            reaction_picker: None,
+            pending_reaction: None,
             current_chat_id: None,
             status_message: None,
             status_is_error: false,
@@ -184,6 +189,10 @@ impl App {
             }
             // Direct input confirms focus on terminals without focus reports.
             self.terminal_focused = true;
+            if self.reaction_picker.is_some() {
+                self.handle_reaction_key(key_event, backend);
+                return;
+            }
             // When help popup is visible, any key closes it.
             if self.show_help {
                 self.show_help = false;
@@ -240,6 +249,9 @@ impl App {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent, backend: &Backend) {
+        if self.reaction_picker.is_some() {
+            return;
+        }
         if !is_actionable(event) {
             return;
         }
@@ -367,6 +379,11 @@ impl App {
                 self.handle_sidebar_enter(backend);
             }
             // Messages pane keys
+            KeyCode::Char('r')
+                if self.active_pane == Pane::Messages && key_event.modifiers.is_empty() =>
+            {
+                self.open_reactions();
+            }
             KeyCode::Up | KeyCode::Char('k') if self.active_pane == Pane::Messages => {
                 self.messages.select_previous();
             }
@@ -516,6 +533,97 @@ impl App {
                 if m.is_empty() || m == KeyModifiers::SHIFT {
                     self.compose.insert_char(c);
                 }
+            }
+            _ => {}
+        }
+    }
+
+    fn open_reactions(&mut self) {
+        if self.pending_reaction.is_some() {
+            self.status_message = Some("A reaction update is still pending".into());
+            self.status_is_error = false;
+            return;
+        }
+        let target = self
+            .current_chat_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+            .zip(self.messages.messages.get(self.messages.selected));
+        let Some((chat_id, message)) =
+            target.filter(|(_, message)| message.native_id.is_some() && !self.messages.loading)
+        else {
+            self.set_error("Select a loaded message to react to".into());
+            return;
+        };
+        if self
+            .current_user_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            self.set_error("Wait for your account identity to load before reacting".into());
+            return;
+        }
+        self.reaction_picker = Some(ReactionPicker::new(
+            chat_id.clone(),
+            message.native_id.clone().unwrap(),
+            &message.reactions,
+            self.current_user_id.as_deref(),
+        ));
+    }
+
+    fn handle_reaction_key(&mut self, key: crossterm::event::KeyEvent, backend: &Backend) {
+        if key.code == KeyCode::Esc {
+            self.reaction_picker = None;
+            return;
+        }
+        let Some(picker) = self.reaction_picker.as_mut() else {
+            return;
+        };
+        if picker.pending {
+            return;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = (picker.selected + 1).min(picker.choices.len().saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                let message = self
+                    .messages
+                    .messages
+                    .iter()
+                    .find(|m| m.native_id.as_deref() == Some(&picker.message_id));
+                let Some(message) = message.filter(|_| {
+                    self.current_chat_id.as_ref() == Some(&picker.chat_id) && !self.messages.loading
+                }) else {
+                    self.reaction_picker = None;
+                    self.set_error("The selected message is no longer available".into());
+                    return;
+                };
+                let Some(user) = self
+                    .current_user_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                else {
+                    picker.error = Some("Your account identity is unavailable".into());
+                    return;
+                };
+                let Some(key) = picker.choices.get(picker.selected).cloned() else {
+                    return;
+                };
+                let remove = message
+                    .reactions
+                    .iter()
+                    .any(|r| r.key == key && r.is_own(Some(user)));
+                picker.pending = true;
+                picker.error = None;
+                self.pending_reaction = Some((picker.chat_id.clone(), picker.message_id.clone()));
+                backend.send(BackendCommand::ChangeReaction {
+                    chat_id: picker.chat_id.clone(),
+                    message_id: picker.message_id.clone(),
+                    key,
+                    remove,
+                });
             }
             _ => {}
         }
@@ -761,6 +869,45 @@ impl App {
                     }
                 }
             }
+            BackendResponse::ReactionChanged {
+                chat_id,
+                message_id,
+                result,
+            } => {
+                let target = (chat_id.clone(), message_id.clone());
+                if self.pending_reaction.as_ref() == Some(&target) {
+                    self.pending_reaction = None;
+                }
+                let matches_picker = self
+                    .reaction_picker
+                    .as_ref()
+                    .is_some_and(|p| p.chat_id == chat_id && p.message_id == message_id);
+                match result {
+                    Ok(reactions) => {
+                        if matches_picker {
+                            self.reaction_picker = None;
+                        }
+                        if let Some(reactions) = reactions {
+                            if self.current_chat_id.as_deref() == Some(&chat_id) {
+                                self.messages.update_reactions(&message_id, reactions);
+                            }
+                            self.status_message = Some("Reaction updated".into());
+                            self.status_is_error = false;
+                        } else {
+                            self.set_error("Reaction updated, but refresh failed; reopen the conversation to reload".into());
+                        }
+                    }
+                    Err(error) => {
+                        let text = format!("Reaction failed: {error:#}");
+                        if matches_picker {
+                            let picker = self.reaction_picker.as_mut().unwrap();
+                            picker.pending = false;
+                            picker.error = Some(text.clone());
+                        }
+                        self.set_error(text);
+                    }
+                }
+            }
             BackendResponse::MessageSent {
                 chat_id,
                 result: Ok(()),
@@ -794,6 +941,12 @@ impl App {
                 self.presence = "unknown".into();
             }
             BackendResponse::ClientError(msg) => {
+                // Authentication failure cannot leave an unresponsive modal.
+                self.pending_reaction = None;
+                if let Some(picker) = self.reaction_picker.as_mut() {
+                    picker.pending = false;
+                    picker.error = Some(format!("Auth: {msg}"));
+                }
                 self.connection_state = "Not authenticated".to_string();
                 self.is_online = false;
                 self.sidebar.loading = false;
@@ -919,6 +1072,7 @@ impl App {
         self.terminal_focused
             && !self.show_help
             && !self.search.active
+            && self.reaction_picker.is_none()
             && !self.messages.loading
             && self.loaded_last_stamp.is_some()
             && self.messages.rendered_latest
@@ -1169,6 +1323,7 @@ mod notification_tests {
                     sender: message.sender.clone(),
                     timestamp: message.timestamp.clone(),
                     content: message.content.clone(),
+                    reactions: Vec::new(),
                     mentions: vec!["me".into()],
                 }]),
             },
@@ -1214,3 +1369,7 @@ mod activity_tests;
 #[cfg(test)]
 #[path = "unread_tests.rs"]
 mod unread_tests;
+
+#[cfg(test)]
+#[path = "reaction_tests.rs"]
+mod reaction_tests;

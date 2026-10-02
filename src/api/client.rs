@@ -21,6 +21,17 @@ pub struct TeamsClient {
 }
 
 impl TeamsClient {
+    #[cfg(test)]
+    pub(super) fn for_test(base: &str) -> Self {
+        let mut config = Config::default();
+        config.set_skype_token("test-skype-token".into(), None);
+        config.set_region_gtms(serde_json::json!({"chatService": base}));
+        Self {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            config,
+        }
+    }
+
     /// Load config and build client. Attempts token refresh if AAD token is expired.
     pub async fn new() -> Result<Self> {
         let _refresh_guard = AUTH_REFRESH_LOCK.lock().await;
@@ -257,6 +268,31 @@ impl TeamsClient {
             .with_context(|| format!("Chat GET {} failed", url))?;
 
         check_response(resp, url).await
+    }
+
+    /// Change only the authenticated user's selected reaction.
+    pub(super) async fn chat_reaction(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        remove: bool,
+    ) -> Result<reqwest::Response> {
+        let token = self.skype_token()?;
+        let (method, caller) = if remove {
+            (reqwest::Method::DELETE, "updateMessageReactionRemove")
+        } else {
+            (reqwest::Method::PUT, "updateMessageReactionAdd")
+        };
+        let response = self
+            .http
+            .request(method, url)
+            .header("Authentication", format!("skypetoken={token}"))
+            .header("x-ms-client-caller", caller)
+            .json(body)
+            .send()
+            .await
+            .context("Reaction request failed")?;
+        check_response(response, url).await
     }
 
     /// POST using `Authentication: skypetoken=...` header (native chat API).

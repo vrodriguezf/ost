@@ -120,6 +120,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.mouse.add(area, Target::Help);
         help::render_help_popup(frame);
     }
+    if let Some(picker) = &app.reaction_picker {
+        app.mouse.clear();
+        app.messages.links.clear();
+        let reactions = app
+            .messages
+            .messages
+            .iter()
+            .find(|message| message.native_id.as_deref() == Some(&picker.message_id))
+            .map(|message| message.reactions.as_slice())
+            .unwrap_or_default();
+        super::reactions::render(frame, picker, reactions, app.current_user_id.as_deref());
+    }
 }
 
 /// Render the header bar

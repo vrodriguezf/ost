@@ -17,9 +17,23 @@ use crate::{api, api::client::TeamsClient, trouter::subscription};
 
 pub enum BackendCommand {
     LoadTeams,
-    LoadChats { limit: usize },
-    LoadMessages { chat_id: String, limit: usize },
-    SendMessage { chat_id: String, message: String },
+    LoadChats {
+        limit: usize,
+    },
+    LoadMessages {
+        chat_id: String,
+        limit: usize,
+    },
+    SendMessage {
+        chat_id: String,
+        message: String,
+    },
+    ChangeReaction {
+        chat_id: String,
+        message_id: String,
+        key: String,
+        remove: bool,
+    },
     LoadUserInfo,
     LoadPresence,
 }
@@ -42,6 +56,12 @@ pub enum BackendResponse {
     MessageSent {
         chat_id: String,
         result: Result<()>,
+    },
+    ReactionChanged {
+        chat_id: String,
+        message_id: String,
+        /// None means the mutation succeeded but its follow-up read failed.
+        result: Result<Option<Vec<api::Reaction>>>,
     },
     UserInfo(Result<api::UserInfo>),
     Presence(Result<api::PresenceInfo>),
@@ -449,6 +469,10 @@ async fn backend_loop(
                 let client = match client().await {
                     Ok(client) => client,
                     Err(error) => {
+                        if let BackendCommand::ChangeReaction { chat_id, message_id, .. } = command {
+                            let _ = resp_tx.send(BackendResponse::ReactionChanged { chat_id, message_id, result: Err(error) });
+                            continue;
+                        }
                         let _ = resp_tx.send(BackendResponse::ClientError(error.to_string()));
                         chats_due = true;
                         continue;
@@ -472,6 +496,22 @@ async fn backend_loop(
                         }
                         let _ = resp_tx.send(BackendResponse::MessageSent { chat_id, result });
                         chats_due = true;
+                    }
+                    BackendCommand::ChangeReaction { chat_id, message_id, key, remove } => {
+                        let result = match api::change_reaction(&client, &chat_id, &message_id, &key, remove).await {
+                            Ok(()) => {
+                                pending.insert(chat_id.clone());
+                                match api::read_reactions(&client, &chat_id, &message_id).await {
+                                    Ok(reactions) => Ok(Some(reactions)),
+                                    Err(error) => {
+                                        tracing::warn!("Reaction updated but refresh failed: {error:#}");
+                                        Ok(None)
+                                    }
+                                }
+                            }
+                            Err(error) => Err(error),
+                        };
+                        let _ = resp_tx.send(BackendResponse::ReactionChanged { chat_id, message_id, result });
                     }
                     BackendCommand::LoadUserInfo => { let _ = resp_tx.send(BackendResponse::UserInfo(api::whoami_data(&client).await)); }
                     BackendCommand::LoadPresence => { let _ = resp_tx.send(BackendResponse::Presence(api::get_presence_data(&client).await)); }
@@ -601,6 +641,7 @@ mod tests {
             sender: "Other".into(),
             timestamp: timestamp.into(),
             content: "Hello".into(),
+            reactions: Vec::new(),
             mentions: vec![],
         }
     }
@@ -619,6 +660,24 @@ mod tests {
         assert!(tracker
             .observe("chat", &[message("500", "2025-01-01T00:00:00Z")], false)
             .is_empty());
+    }
+
+    #[test]
+    fn reaction_only_refresh_delivers_counts_without_incoming_activity() {
+        let mut tracker = ActivityTracker::new();
+        let mut original = message("1000", "2026-01-01T00:00:00Z");
+        tracker.observe("chat", std::slice::from_ref(&original), true);
+        original.reactions = vec![api::Reaction {
+            key: "like".into(),
+            count: 1,
+            users: vec!["other".into()],
+        }];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        deliver_messages(&tx, &mut tracker, "chat", Ok(vec![original]), false, true);
+        assert!(
+            matches!(rx.try_recv().unwrap(), BackendResponse::Messages { result: Ok(messages), .. } if messages[0].reactions[0].count == 1)
+        );
+        assert!(rx.try_recv().is_err());
     }
     #[test]
     fn invalidations_are_bounded_coalesced_and_fifo() {

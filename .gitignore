@@ -19,5 +19,4 @@ Thumbs.db
 .env
 *.local
 tmp/
-.aider.tags.cache.v4
-.aider.chat.history.md
+.aider*

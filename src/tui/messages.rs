@@ -12,6 +12,7 @@ use ratatui::{
 use super::hyperlinks::{self, Link};
 use super::mouse::{HitMap, Target, Viewport};
 use crate::api;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// Default header shown when no channel is selected.
@@ -20,15 +21,6 @@ const DEFAULT_HEADER: &str = "Select a channel or chat";
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
-
-/// A reaction on a message (e.g., thumbs-up x3).
-#[derive(Clone)]
-pub struct Reaction {
-    /// ASCII-safe label: "+1", "<3", "eyes", etc.
-    pub label: String,
-    /// How many people reacted with this.
-    pub count: u32,
-}
 
 /// A file attachment on a message.
 #[derive(Clone)]
@@ -41,6 +33,8 @@ pub struct Attachment {
 #[derive(Clone)]
 pub struct Message {
     pub id: String,
+    /// Service ID; absent for messages with only a synthetic display identity.
+    pub native_id: Option<String>,
     pub sender_id: String,
     /// Sender display name.
     pub sender: String,
@@ -49,7 +43,7 @@ pub struct Message {
     /// Message body lines.
     pub content: String,
     /// Reactions below the message.
-    pub reactions: Vec<Reaction>,
+    pub reactions: Vec<api::Reaction>,
     /// Number of thread replies (0 = no thread).
     pub reply_count: u32,
     /// Inline thread replies (shown when expanded).
@@ -125,6 +119,7 @@ impl MessagesState {
             self.scroll_anchor = None;
         }
         for message in api_messages {
+            let native_id = (!message.id.trim().is_empty()).then(|| message.id.clone());
             let id = if message.id.is_empty() {
                 format!(
                     "{}|{}|{}",
@@ -138,6 +133,8 @@ impl MessagesState {
                 existing.sender = message.sender;
                 existing.timestamp = message.timestamp;
                 existing.content = message.content;
+                existing.reactions = message.reactions;
+                existing.native_id = native_id;
             } else {
                 let key = crate::api::message_sort_key(&message.timestamp, &id);
                 let position = self.messages.partition_point(|existing| {
@@ -147,11 +144,12 @@ impl MessagesState {
                     position,
                     Message {
                         id,
+                        native_id,
                         sender_id: message.sender_id,
                         sender: message.sender,
                         timestamp: message.timestamp,
                         content: message.content,
-                        reactions: Vec::new(),
+                        reactions: message.reactions,
                         reply_count: 0,
                         replies: Vec::new(),
                         attachments: Vec::new(),
@@ -172,6 +170,19 @@ impl MessagesState {
         self.viewport.follow_bottom = following_bottom || (!initial && follow_latest);
         self.restore_anchor = !initial && !follow_latest && !self.viewport.follow_selection;
         self.loading = false;
+    }
+
+    /// A reaction-only refresh cannot move selection or replace message history.
+    pub fn update_reactions(&mut self, message_id: &str, reactions: Vec<api::Reaction>) {
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|m| m.native_id.as_deref() == Some(message_id))
+        {
+            message.reactions = reactions;
+            self.restore_anchor = !self.viewport.follow_bottom && !self.viewport.follow_selection;
+            self.rendered_latest = false;
+        }
     }
 
     /// Reveal the end of this conversation and keep following until navigation.
@@ -650,36 +661,77 @@ fn render_message_card(
         ));
     }
 
-    // Reactions and reply count.
-    if !msg.reactions.is_empty() || msg.reply_count > 0 {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.push(Span::styled(content_prefix.clone(), bg_style));
-        let mut used = content_prefix.len();
-
-        for (i, r) in msg.reactions.iter().enumerate() {
-            let r_text = format!("{} {}", r.label, r.count);
-            used += r_text.len();
-            spans.push(Span::styled(
-                r_text,
-                Style::default().fg(Color::Yellow).bg(bg),
-            ));
-            if i + 1 < msg.reactions.len() || msg.reply_count > 0 {
-                spans.push(Span::styled("   ", bg_style));
-                used += 3;
-            }
-        }
-
-        if msg.reply_count > 0 {
-            let reply_text = format!(">> {} replies", msg.reply_count);
-            used += reply_text.len();
-            spans.push(Span::styled(
-                reply_text,
-                Style::default().fg(Color::Cyan).bg(bg),
-            ));
-        }
-
+    // Wrap reaction tokens independently of the message body. Service keys may
+    // contain arbitrary Unicode, including long custom emoji names.
+    let reaction_width = effective_width.saturating_sub(content_prefix.width());
+    let mut tokens: Vec<(String, Style)> = msg
+        .reactions
+        .iter()
+        .map(|reaction| {
+            let own = reaction.is_own(current_user_id);
+            (
+                format!(
+                    "{} {}{}",
+                    reaction.label(),
+                    reaction.count,
+                    if own { " (you)" } else { "" }
+                ),
+                Style::default()
+                    .fg(if own { Color::Green } else { Color::Yellow })
+                    .bg(bg),
+            )
+        })
+        .collect();
+    if msg.reply_count > 0 {
+        tokens.push((
+            format!(">> {} replies", msg.reply_count),
+            Style::default().fg(Color::Cyan).bg(bg),
+        ));
+    }
+    for mut spans in wrap_reaction_tokens(tokens, reaction_width, bg_style) {
+        let used = content_prefix.width() + spans.iter().map(Span::width).sum::<usize>();
+        spans.insert(0, Span::styled(content_prefix.clone(), bg_style));
         lines.push(make_bg_line(spans, used));
     }
+}
+
+/// Keep normal reaction tokens together; split unusually long keys by grapheme.
+fn wrap_reaction_tokens(
+    tokens: Vec<(String, Style)>,
+    width: usize,
+    background: Style,
+) -> Vec<Vec<Span<'static>>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut line = Vec::new();
+    let mut used = 0;
+    for (token, style) in tokens {
+        if used > 0 && used + 3 + token.width() > width {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        if used > 0 {
+            line.push(Span::styled("   ", background));
+            used += 3;
+        }
+        let mut part = String::new();
+        for grapheme in token.graphemes(true) {
+            if used + grapheme.width() > width {
+                line.push(Span::styled(std::mem::take(&mut part), style));
+                lines.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            part.push_str(grapheme);
+            used += grapheme.width();
+        }
+        line.push(Span::styled(part, style));
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Format an ISO 8601 timestamp string into a human-readable form.
@@ -794,6 +846,102 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reaction_strip_wraps_all_counts_and_long_unicode_labels() {
+        let mut state = MessagesState::default();
+        state.update_messages(
+            "Chat",
+            vec![api::MessageInfo {
+                id: "1".into(),
+                sender_id: "other".into(),
+                sender: "Other".into(),
+                timestamp: "".into(),
+                content: "Hello".into(),
+                mentions: vec![],
+                reactions: [
+                    "like",
+                    "heart",
+                    "laugh",
+                    "surprised",
+                    "sad",
+                    "angry",
+                    "自定义表情自定义表情自定义表情自定义表情",
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, key)| api::Reaction {
+                    key: key.into(),
+                    count: index as u32 + 1,
+                    users: vec!["me".into()],
+                })
+                .collect(),
+            }],
+        );
+        let lines = build_message_lines(&state, 34, "Me", Some("me")).0;
+        let reaction_lines: Vec<_> = lines
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.style.fg == Some(Color::Green))
+            })
+            .collect();
+        assert!(reaction_lines.len() >= 4);
+        assert!(reaction_lines.iter().all(|line| line.width() <= 34));
+        let text: String = reaction_lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.fg == Some(Color::Green))
+            .map(|span| span.content.as_ref())
+            .collect();
+        for (index, reaction) in state.messages[0].reactions.iter().enumerate() {
+            assert!(
+                text.contains(&format!("{} {} (you)", reaction.label(), index + 1)),
+                "Missing reaction in {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn reaction_merge_replaces_counts_and_resolves_delayed_identity() {
+        let mut state = MessagesState::default();
+        let mut message = api::MessageInfo {
+            id: "1".into(),
+            sender_id: "other".into(),
+            sender: "Other".into(),
+            timestamp: "".into(),
+            content: "Hello".into(),
+            mentions: vec![],
+            reactions: vec![api::Reaction {
+                key: "like".into(),
+                count: 2,
+                users: vec!["me".into(), "other".into()],
+            }],
+        };
+        state.update_messages("Chat", vec![message.clone()]);
+        let rendered = |state: &MessagesState, user: Option<&str>| -> String {
+            build_message_lines(state, 80, "Me", user)
+                .0
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        assert!(!rendered(&state, None).contains("(you)"));
+        assert!(rendered(&state, Some("8:orgid:ME")).contains("+1 2 (you)"));
+        message.reactions = vec![api::Reaction {
+            key: "heart".into(),
+            count: 1,
+            users: vec!["other".into()],
+        }];
+        state.update_messages("Chat", vec![message.clone()]);
+        assert!(rendered(&state, Some("me")).contains("<3 1"));
+        assert!(!rendered(&state, Some("me")).contains("+1"));
+        message.reactions.clear();
+        state.update_messages("Chat", vec![message]);
+        assert!(state.messages[0].reactions.is_empty());
+    }
+
     fn render_sender(sender_id: &str, sender: &str, user: Option<&str>) -> Vec<Line<'static>> {
         let mut state = MessagesState::default();
         state.update_messages(
@@ -804,6 +952,7 @@ mod tests {
                 sender: sender.into(),
                 timestamp: "2026-09-18T12:00:00Z".into(),
                 content: "A new message".into(),
+                reactions: Vec::new(),
                 mentions: Vec::new(),
             }],
         );
@@ -823,6 +972,7 @@ mod tests {
                 timestamp: "2026-09-28T10:00:00Z".into(),
                 content: url.clone(),
                 mentions: Vec::new(),
+                reactions: Vec::new(),
             }],
         );
         let reply = state.messages[0].clone();

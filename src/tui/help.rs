@@ -159,7 +159,7 @@ const ACTIONS: Category = Category {
     shortcuts: &[
         Shortcut {
             key: "r",
-            desc: "Reply to message",
+            desc: "Add/remove reaction",
         },
         Shortcut {
             key: "e",
@@ -168,10 +168,6 @@ const ACTIONS: Category = Category {
         Shortcut {
             key: "d",
             desc: "Delete message (confirm)",
-        },
-        Shortcut {
-            key: "+",
-            desc: "Add reaction",
         },
         Shortcut {
             key: "@",

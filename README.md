@@ -117,6 +117,12 @@ Keyboard navigation remains available. For terminal text selection, use your ter
 
 Long message URLs wrap within the pane and retain their full destination through terminal hyperlinks (OSC 8). Use your terminal's link-opening shortcut, such as Ctrl+Shift+click in Kitty. Terminals or multiplexers without OSC 8 support may still detect only the visible URL fragment.
 
+To react, focus the messages pane, select a message, and press **r**. Use **Up/Down**
+or **j/k** to choose a reaction, **Enter** to apply it, and **Esc** to close the
+picker. Reactions you already added show **Remove**; selecting one removes only
+your reaction. Counts appear below each message, with **(you)** beside your own
+reactions. Updates preserve your draft and reading position. Closing the picker
+while an update is pending does not cancel the request already sent.
 
 ### Live updates
 

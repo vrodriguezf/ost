@@ -55,10 +55,10 @@
 │  g g      Jump to top                                                                │
 │  G        Jump to bottom             ACTIONS                                         │
 │  /        Search in current view     ──────────────────────────────────────────────  │
-│  Ctrl+K   Global search              r         Reply to message                      │
+│  Ctrl+K   Global search              r         Add/remove reaction                   │
 │                                      e         Edit your message                     │
 │  PANES                               d         Delete your message (confirm)         │
-│  ──────────────────────────────────  +         Add reaction                          │
+│  ──────────────────────────────────                                                  │
 │  1        Teams/Channels pane        @         Mention user                          │
 │  2        Chat/Messages pane         Ctrl+P    Attach file                           │
 │  3        Compose pane                                                               │

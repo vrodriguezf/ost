@@ -14,6 +14,7 @@ mod log_capture;
 mod messages;
 mod mouse;
 mod notifications;
+mod reactions;
 mod search;
 mod sidebar;
 mod text_input;
