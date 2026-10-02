@@ -7,6 +7,10 @@ pub enum MessageBlock {
     Text(String),
     Quote {
         author: Option<String>,
+        /// Explicit author identity; display labels may be service placeholders.
+        author_id: Option<String>,
+        /// Referenced message identity, never the ID of this reply itself.
+        message_id: Option<String>,
         text: String,
     },
 }
@@ -44,7 +48,7 @@ fn plain_text(blocks: &[MessageBlock]) -> String {
         .iter()
         .map(|block| match block {
             MessageBlock::Text(text) => text.clone(),
-            MessageBlock::Quote { author, text } => {
+            MessageBlock::Quote { author, text, .. } => {
                 let mut lines = vec![format!(
                     "> {}",
                     author.as_deref().unwrap_or("Quoted message")
@@ -142,8 +146,51 @@ fn author_element(element: ElementRef<'_>, depth: usize) -> Option<ElementRef<'_
     None
 }
 
+/// Identity metadata can be empty of visible text or separate from the name
+/// element. Never borrow an MRI from a mention in the preview or a nested quote.
+fn author_identity(element: ElementRef<'_>, depth: usize) -> Option<String> {
+    if depth > 64 {
+        return None;
+    }
+    for child in element.child_elements() {
+        if is_quote(child) || has_property(child, "preview") {
+            continue;
+        }
+        if has_property(child, "mri") {
+            if let Some(identity) = metadata_attribute(child, "itemid") {
+                return Some(identity);
+            }
+        }
+        if let Some(identity) = author_identity(child, depth + 1) {
+            return Some(identity);
+        }
+    }
+    None
+}
+
+fn metadata_attribute(element: ElementRef<'_>, attribute: &str) -> Option<String> {
+    element
+        .attr(attribute)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 fn parse_quote(element: ElementRef<'_>, depth: usize) -> MessageBlock {
     let author_node = author_element(element, 0);
+    let author_id = author_identity(element, 0).or_else(|| {
+        (element.value().name() == "quote")
+            .then(|| metadata_attribute(element, "author"))
+            .flatten()
+    });
+    let message_id = metadata_attribute(
+        element,
+        if element.value().name() == "quote" {
+            "messageid"
+        } else {
+            "itemid"
+        },
+    );
     let author = element
         .attr("authorname")
         .or_else(|| element.attr("data-author-name"))
@@ -163,7 +210,12 @@ fn parse_quote(element: ElementRef<'_>, depth: usize) -> MessageBlock {
     // Nested quotes retain their own attribution and text inside the outer
     // quote. Flattening their readable form avoids discarding nested context.
     let text = plain_text(&output.finish());
-    MessageBlock::Quote { author, text }
+    MessageBlock::Quote {
+        author,
+        author_id,
+        message_id,
+        text,
+    }
 }
 
 fn visit_children(
@@ -276,6 +328,8 @@ mod tests {
     fn quote(author: Option<&str>, value: &str) -> MessageBlock {
         MessageBlock::Quote {
             author: author.map(str::to_owned),
+            author_id: None,
+            message_id: None,
             text: value.to_owned(),
         }
     }
@@ -297,7 +351,12 @@ mod tests {
         assert_eq!(
             parsed.blocks,
             vec![
-                quote(Some("Alice & Bob"), "han mejorado la infra"),
+                MessageBlock::Quote {
+                    author: Some("Alice & Bob".into()),
+                    author_id: Some("8:orgid:alice".into()),
+                    message_id: Some("42".into()),
+                    text: "han mejorado la infra".into(),
+                },
                 text("En el devday presumieron de que habían mejorado aún más")
             ]
         );
@@ -322,6 +381,88 @@ mod tests {
                 true
             ).blocks,
             vec![quote(Some("María García"), "first\nsecond"), text("reply")]
+        );
+    }
+
+    #[test]
+    fn native_placeholder_author_retains_identity_and_referenced_message() {
+        let parsed = parse_message_content(
+            "<blockquote itemtype='http://schema.skype.com/Reply' itemid=' 42 '><strong itemprop='mri' itemid=' 8:orgid:alice '>Display Name</strong><span itemprop='time' itemid='99'></span><p itemprop='preview'>Original</p></blockquote><p>Response</p>",
+            true,
+        );
+        assert_eq!(
+            parsed.blocks,
+            vec![
+                MessageBlock::Quote {
+                    author: Some("Display Name".into()),
+                    author_id: Some("8:orgid:alice".into()),
+                    message_id: Some("42".into()),
+                    text: "Original".into(),
+                },
+                text("Response"),
+            ]
+        );
+        assert_eq!(parsed.plain_text, "> Display Name\n> Original\n\nResponse");
+    }
+
+    #[test]
+    fn empty_identity_nodes_are_independent_of_visible_author_names() {
+        for (name, author) in [
+            ("", None),
+            (
+                "<span itemprop='name'>Display Name</span>",
+                Some("Display Name"),
+            ),
+        ] {
+            assert_eq!(
+                parse_message_content(
+                    &format!("<blockquote itemid='42'><strong itemprop='mri' itemid='8:orgid:alice'></strong>{name}<p itemprop='preview'>Original</p></blockquote>"),
+                    true
+                ).blocks,
+                vec![MessageBlock::Quote {
+                    author: author.map(str::to_owned),
+                    author_id: Some("8:orgid:alice".into()),
+                    message_id: Some("42".into()),
+                    text: "Original".into(),
+                }]
+            );
+        }
+        assert_eq!(
+            parse_message_content(
+                "<blockquote itemid=' '><strong itemprop='mri' itemid=' '></strong><span itemprop='time' itemid='99'></span><p itemprop='preview'>Original</p></blockquote>",
+                true
+            ).blocks,
+            vec![quote(None, "Original")]
+        );
+    }
+
+    #[test]
+    fn legacy_quote_retains_explicit_author_and_message_identity() {
+        assert_eq!(
+            parse_message_content(
+                "<quote author=' 8:orgid:alice ' authorname='Display Name' messageid=' 42 '><legacyquote>[Display Name]</legacyquote>Original</quote>Response",
+                true
+            ).blocks,
+            vec![
+                MessageBlock::Quote {
+                    author: Some("Display Name".into()),
+                    author_id: Some("8:orgid:alice".into()),
+                    message_id: Some("42".into()),
+                    text: "Original".into(),
+                },
+                text("Response"),
+            ]
+        );
+    }
+
+    #[test]
+    fn quote_identity_never_comes_from_preview_mentions_or_nested_quotes() {
+        assert_eq!(
+            parse_message_content(
+                "<blockquote><p itemprop='preview'>Hello <span itemprop='mri' itemid='8:orgid:alice'>Alice</span></p><blockquote itemid='7'><strong itemprop='mri' itemid='8:orgid:bob'>Bob</strong><p>Nested</p></blockquote></blockquote>",
+                true
+            ).blocks,
+            vec![quote(None, "Hello Alice\n\n> Bob\n> Nested")]
         );
     }
 

@@ -102,8 +102,9 @@ QUOTED REPLIES:
 ────────────────
 Quoted content stays inside its message card, using a slim accent bar and muted
 text to distinguish it from the reply. The quoted author's name appears separately;
-when unavailable, the label is "Quoted message". Text and links wrap within the
-card, and wrapped links retain their complete terminal hyperlink destination.
+missing or placeholder authors resolve from quoted-user metadata and verified
+participant names; otherwise the label is "Quoted message". Text and links wrap
+within the card, and wrapped links retain their complete hyperlink destination.
 
   > Jorge Martin la Pena                                      12:34
       │ ↪ Original author

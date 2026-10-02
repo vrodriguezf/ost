@@ -79,6 +79,27 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(content_area);
 
+    // Only a verified one-to-one peer label can repair quote attribution.
+    // Recompute on every draw so background name updates and chat switches apply.
+    app.messages.quote_peer = app
+        .current_chat_id
+        .as_deref()
+        .and_then(|id| app.sidebar.chats.iter().find(|chat| chat.id == id))
+        .filter(|chat| {
+            !chat.is_group
+                && matches!(
+                    chat.name_source,
+                    crate::api::ChatNameSource::Participants
+                        | crate::api::ChatNameSource::LastSender
+                )
+                && crate::api::names::valid_name(&chat.name)
+        })
+        .and_then(|chat| {
+            let user = app.current_user_id.as_deref()?;
+            let peer = crate::api::names::direct_chat_peer(&chat.id, user)?;
+            Some((peer, chat.name.trim().to_owned()))
+        });
+
     // Render messages pane
     messages::render(
         messages_area,

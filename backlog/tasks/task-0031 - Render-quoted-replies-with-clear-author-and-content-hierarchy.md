@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@codex'
 created_date: '2026-10-02 10:10'
-updated_date: '2026-10-02 10:31'
+updated_date: '2026-10-02 11:09'
 labels:
   - tui
   - ux
@@ -28,6 +28,7 @@ Quoted replies currently lose their HTML structure before reaching the TUI, caus
 - [x] #2 Reply context uses a subtle vertical accent, a clear author or fallback label, muted quoted text, and normal emphasis for the new response within the existing message cards.
 - [x] #3 Multiline text, HTML entities, Unicode, and narrow panes remain readable without losing message text; unquoted messages retain their expected presentation.
 - [x] #4 Quoted reply rendering preserves complete URL targets, own-message alignment, selection, scrolling, and live refresh behavior.
+- [x] #5 Placeholder quote authors such as Display Name resolve to the original sender using explicit quote identity or referenced message metadata, including own-message quotes; unresolved authors never masquerade as the reply sender.
 <!-- AC:END -->
 
 ## Definition of Done
@@ -57,12 +58,17 @@ User approved the layout and requested subagents. Implementing on fix/quoted-rep
 Implemented structured Teams reply parsing with explicit author metadata and readable plain text for CLI/search. Quotes render as an inset with the existing author palette, a slim rail, muted text, and separation from the response; current card selection and own-message alignment are retained.
 Validation: cargo test --locked (220 passed, 3 ignored); cargo fmt --check; cargo clippy --locked --all-targets (existing warnings); git diff --check; PTY normal/error/panic checks passed. Parser, rendering, mouse selection, search, draft/history preservation, Unicode wrapping, full hyperlinks, and native HTTP-response fixtures are covered.
 Visually inspected /tmp/ost-reply-preview.png, generated from a 120x38 production Ratatui buffer. Independent code review found no blockers. The parser dependency graph was added without upgrading existing lockfile versions.
+
+Follow-up from user: groups render correctly, but one-to-one reply headers expose Teams placeholder Display Name. Continuing the approved quoted-author work on the same branch. The parser currently keeps only the visible author text, discarding the MRI and referenced message ID needed to resolve the real name. Preserve those identifiers and resolve placeholders from verified message/account identities at render time, with regression tests for peer/self quotes and late-arriving names.
+
+Fixed one-to-one placeholder attribution by retaining quote author MRI and original native message ID. At draw time, missing/Display Name labels resolve from matching message history, the current account, or a verified direct-chat peer label. Real explicit names remain unchanged; mismatched/unresolved identities fall back to Quoted message. Participant context is recalculated every draw to handle delayed names and chat switches without stale attribution.
+Follow-up validation: 233 tests passed, 3 ignored; cargo fmt --check, cargo clippy --locked --all-targets (existing warnings), git diff --check, and all PTY modes passed. Independent review found no blocking issues. Added peer/self, late-name, old-message, metadata conflict, malformed identity, and conversation-switch regressions.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Quoted replies now show the original author and quoted text in a muted inset, followed by the response at normal emphasis. This fixes author/text concatenation and makes reply context readable while preserving existing card colors, selection, sent-message alignment, and reactions.
-The native message parser preserves ordered text/quote blocks, paragraph boundaries, decoded HTML entities, fallback labels, and full link destinations. CLI output and search retain readable content. Sender headers also fit narrow panes using Unicode-aware truncation.
-Validation: 220 tests passed, 3 ignored; formatting, Clippy, diff checks, and normal/error/panic terminal smoke tests passed. Added parser/API and rendering regressions, quote selection/search/history tests, and a full-screen visual fixture; updated README and TUI specification. No authenticated live account requests or writes were needed.
+Quoted replies now distinguish the original author and muted quoted text from the response while preserving existing card colors, selection, sent-message alignment, and reactions.
+Structured native parsing retains ordered quote/text blocks, paragraph boundaries, HTML entities, author identity, and original-message identity. Placeholder names such as Display Name resolve using the original message, known sender identity, current account, or verified direct-chat peer; unknown attribution uses Quoted message. Real quoted author labels remain intact. Long text and links wrap safely, and CLI/search retain readable message content.
+Validation: 233 tests passed, 3 ignored; formatting, Clippy, diff checks, and normal/error/panic terminal smoke tests passed. Coverage includes parser/API fixtures, Unicode/hyperlinks, peer/self attribution, late name updates, mouse selection, search, draft/history preservation, and conversation switches. The full-screen layout was visually checked and documentation updated.
 <!-- SECTION:FINAL_SUMMARY:END -->

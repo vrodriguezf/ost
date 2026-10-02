@@ -119,8 +119,10 @@ Long message URLs wrap within the pane and retain their full destination through
 
 Quoted replies show the original author and muted quoted text beside a slim accent
 bar, with the reply on its own line below. Long quotes wrap within the message;
-quoted links retain their full destination. Quotes without an author are labeled
-**Quoted message**. Clicking the quote selects the message containing the reply.
+quoted links retain their full destination. Missing or placeholder authors resolve
+from the quoted user's identity and known conversation participants when available;
+otherwise they are labeled **Quoted message**. Clicking the quote selects the
+message containing the reply.
 
 To react, focus the messages pane, select a message, and press **r**. Use **Up/Down**
 or **j/k** to choose a reaction, **Enter** to apply it, and **Esc** to close the

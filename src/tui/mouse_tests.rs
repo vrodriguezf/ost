@@ -319,6 +319,8 @@ fn quoted_author_and_wrapped_quote_select_the_containing_message() {
     h.add_messages(3);
     h.app.messages.messages[1].content_blocks = vec![
         api::MessageBlock::Quote {
+            author_id: None,
+            message_id: None,
             author: Some("Original author".into()),
             text: format!("{}quote tail", "quoted words ".repeat(8)),
         },
@@ -337,6 +339,141 @@ fn quoted_author_and_wrapped_quote_select_the_containing_message() {
     h.click_text("quote tail");
     assert_eq!(h.app.messages.selected, 1);
     assert!(h.commands.try_recv().is_err());
+}
+
+const QUOTE_SELF_ID: &str = "00000000-0000-0000-0000-000000000001";
+const QUOTE_PEER_ID: &str = "00000000-0000-0000-0000-000000000002";
+
+fn direct_chat_with_placeholder_quote(author_id: Option<&str>) -> Harness {
+    let mut h = Harness::new();
+    let chat_id = format!("19:{QUOTE_SELF_ID}_{QUOTE_PEER_ID}@unq.gbl.spaces");
+    h.app.current_chat_id = Some(chat_id.clone());
+    h.app.current_user_id = Some(QUOTE_SELF_ID.into());
+    h.app.sidebar.chats = vec![Chat {
+        id: chat_id,
+        name: api::names::UNKNOWN.into(),
+        name_source: api::ChatNameSource::Identifier,
+        is_group: false,
+        unread: Default::default(),
+        online: false,
+    }];
+    let mut reply = live_message(1, "Quoted body\nMy response");
+    reply.sender_id = format!("8:orgid:{QUOTE_SELF_ID}");
+    reply.sender = "Me".into();
+    reply.content_blocks = vec![
+        api::MessageBlock::Quote {
+            author: Some("Display Name".into()),
+            author_id: author_id.map(|id| format!("8:orgid:{id}")),
+            message_id: Some("older-message-not-loaded".into()),
+            text: "Quoted body".into(),
+        },
+        api::MessageBlock::Text("My response".into()),
+    ];
+    h.app
+        .messages
+        .update_messages(api::names::UNKNOWN, vec![reply]);
+    h
+}
+
+#[test]
+fn quote_peer_name_updates_from_background_labels_without_loaded_peer_messages() {
+    let mut h = direct_chat_with_placeholder_quote(Some(QUOTE_PEER_ID));
+    h.app.active_pane = Pane::Compose;
+    h.app.compose.input = "Unfinished reply".into();
+    h.app.compose.cursor_pos = 4;
+    h.draw();
+    h.text_position("↪ Quoted message");
+    assert!(h.app.messages.quote_peer.is_none());
+
+    for (source, name) in [
+        (api::ChatNameSource::LastSender, "Ana"),
+        (api::ChatNameSource::Participants, "Ana García"),
+    ] {
+        h.app.handle_backend_response(
+            BackendResponse::ChatName {
+                chat_id: h.app.current_chat_id.clone().unwrap(),
+                name: name.into(),
+                source,
+            },
+            &h.backend,
+        );
+        h.draw();
+        h.text_position(&format!("↪ {name}"));
+        assert_eq!(
+            h.app.messages.quote_peer,
+            Some((format!("8:orgid:{QUOTE_PEER_ID}"), name.into()))
+        );
+        assert_eq!(h.app.messages.messages.len(), 1);
+        assert_eq!(h.app.messages.selected, 0);
+        assert_eq!(h.app.compose.input, "Unfinished reply");
+        assert_eq!(h.app.compose.cursor_pos, 4);
+        assert_eq!(h.app.active_pane, Pane::Compose);
+    }
+}
+
+#[test]
+fn quote_of_current_user_uses_account_name_instead_of_direct_chat_peer() {
+    let mut h = direct_chat_with_placeholder_quote(Some(QUOTE_SELF_ID));
+    h.app.sidebar.chats[0].name = "Ana".into();
+    h.app.sidebar.chats[0].name_source = api::ChatNameSource::Participants;
+    h.app.user_name = "Víctor".into();
+    h.draw();
+    h.text_position("↪ Víctor");
+}
+
+#[test]
+fn quote_peer_fallback_rejects_topics_groups_and_unverified_identities() {
+    for case in [
+        "topic",
+        "group",
+        "malformed",
+        "account",
+        "unknown author",
+        "missing author",
+    ] {
+        let mut h = direct_chat_with_placeholder_quote(Some(QUOTE_PEER_ID));
+        h.app.sidebar.chats[0].name = "Ana".into();
+        h.app.sidebar.chats[0].name_source = api::ChatNameSource::Participants;
+        match case {
+            "topic" => h.app.sidebar.chats[0].name_source = api::ChatNameSource::Topic,
+            "group" => h.app.sidebar.chats[0].is_group = true,
+            "malformed" => {
+                h.app.sidebar.chats[0].id = "19:thread@thread.v2".into();
+                h.app.current_chat_id = Some(h.app.sidebar.chats[0].id.clone());
+            }
+            "account" => h.app.current_user_id = Some("unrelated-account".into()),
+            "unknown author" | "missing author" => {
+                let api::MessageBlock::Quote { author_id, .. } =
+                    &mut h.app.messages.messages[0].content_blocks[0]
+                else {
+                    unreachable!()
+                };
+                *author_id = (case == "unknown author").then(|| "8:orgid:unknown-user".into());
+            }
+            _ => unreachable!(),
+        }
+        h.draw();
+        h.text_position("↪ Quoted message");
+        if !matches!(case, "unknown author" | "missing author") {
+            assert!(h.app.messages.quote_peer.is_none(), "case: {case}");
+        }
+    }
+}
+
+#[test]
+fn switching_to_a_channel_or_unloaded_chat_clears_quote_peer() {
+    let mut h = direct_chat_with_placeholder_quote(Some(QUOTE_PEER_ID));
+    h.app.sidebar.chats[0].name = "Ana".into();
+    h.app.sidebar.chats[0].name_source = api::ChatNameSource::Participants;
+    for next_chat in [Some("channel-1"), Some("unloaded-chat"), None] {
+        h.app.current_chat_id = Some(h.app.sidebar.chats[0].id.clone());
+        h.draw();
+        assert!(h.app.messages.quote_peer.is_some());
+        h.app.current_chat_id = next_chat.map(str::to_owned);
+        h.draw();
+        assert!(h.app.messages.quote_peer.is_none());
+        h.text_position("↪ Quoted message");
+    }
 }
 
 #[test]
@@ -592,6 +729,8 @@ fn terminal_session_fixture() {
             format!("https://example.com/{}?a=1&b=2", "long/".repeat(30));
         h.app.messages.messages[0].content_blocks = vec![
             api::MessageBlock::Quote {
+                author_id: None,
+                message_id: None,
                 author: Some("Quoted colleague".into()),
                 text: h.app.messages.messages[0].content.clone(),
             },
@@ -653,6 +792,8 @@ fn quoted_reply_visual_preview_fixture() {
     quoted.sender_id = "8:orgid:jorge".into();
     quoted.content_blocks = vec![
         api::MessageBlock::Quote {
+            author_id: None,
+            message_id: None,
             author: Some("Ana".into()),
             text: "Han mejorado la infra.".into(),
         },
@@ -663,6 +804,8 @@ fn quoted_reply_visual_preview_fixture() {
     own.sender_id = "8:orgid:me".into();
     own.content_blocks = vec![
         api::MessageBlock::Quote {
+            author_id: None,
+            message_id: None,
             author: Some("Jorge Martin la Pena".into()),
             text: reply.into(),
         },
@@ -818,6 +961,8 @@ fn quote_refresh_preserves_draft_selection_and_visible_history() {
     let mut quoted = live_message(1, "Old quote\nThe actual reply");
     quoted.content_blocks = vec![
         api::MessageBlock::Quote {
+            author_id: None,
+            message_id: None,
             author: Some("Original author".into()),
             text: "Old quote".into(),
         },
@@ -842,6 +987,8 @@ fn quote_refresh_preserves_draft_selection_and_visible_history() {
     let updated_quote = format!("Updated quoted text\n{}", "extra quote line\n".repeat(12));
     quoted.content = format!("{updated_quote}\nThe actual reply");
     quoted.content_blocks[0] = api::MessageBlock::Quote {
+        author_id: None,
+        message_id: None,
         author: Some("Original author".into()),
         text: updated_quote,
     };

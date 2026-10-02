@@ -60,6 +60,8 @@ pub struct MessagesState {
     pub links: Vec<Link>,
     /// Channel header text (e.g., "Engineering Team > #general").
     pub channel_header: String,
+    /// Verified direct-chat peer identity/name, refreshed from sidebar on draw.
+    pub quote_peer: Option<(String, String)>,
     /// All messages in the channel.
     pub messages: Vec<Message>,
     /// Viewport offset in rendered lines, independent of mouse selection.
@@ -81,6 +83,7 @@ impl Default for MessagesState {
     fn default() -> Self {
         Self {
             channel_header: DEFAULT_HEADER.to_string(),
+            quote_peer: None,
             links: Vec::new(),
             messages: Vec::new(),
             expanded_threads: Vec::new(),
@@ -447,6 +450,12 @@ fn build_message_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut links = Vec::new();
+    let authors = MessageAuthors {
+        messages: &state.messages,
+        peer: state.quote_peer.as_ref(),
+        user_name,
+        current_user_id,
+    };
 
     for (msg_idx, msg) in state.messages.iter().enumerate() {
         let start = lines.len();
@@ -468,25 +477,14 @@ fn build_message_lines(
             0,
             msg_idx,
             today,
-            user_name,
-            current_user_id,
+            &authors,
         );
 
         // Render thread replies if expanded.
         if thread_expanded && !msg.replies.is_empty() {
             for reply in &msg.replies {
                 render_message_card(
-                    &mut lines,
-                    &mut links,
-                    reply,
-                    width,
-                    false,
-                    true,
-                    4,
-                    msg_idx,
-                    today,
-                    user_name,
-                    current_user_id,
+                    &mut lines, &mut links, reply, width, false, true, 4, msg_idx, today, &authors,
                 );
             }
         } else if msg.reply_count > 0 && !thread_expanded {
@@ -510,6 +508,83 @@ fn build_message_lines(
     (lines, ranges, links)
 }
 
+/// Resolve quote placeholders from identities, never the sender of the reply.
+/// Looking up at draw time lets later history or account metadata repair labels.
+struct MessageAuthors<'a> {
+    messages: &'a [Message],
+    peer: Option<&'a (String, String)>,
+    user_name: &'a str,
+    current_user_id: Option<&'a str>,
+}
+
+fn usable_quote_author(name: &str) -> bool {
+    api::names::valid_name(name)
+        && !name.trim().eq_ignore_ascii_case("Display Name")
+        && name.trim() != "Loading..."
+}
+
+impl MessageAuthors<'_> {
+    fn messages(&self) -> impl DoubleEndedIterator<Item = &Message> {
+        self.messages
+            .iter()
+            .flat_map(|message| std::iter::once(message).chain(message.replies.iter()))
+    }
+
+    fn sender_name(&self, sender_id: &str) -> Option<&str> {
+        if self
+            .current_user_id
+            .is_some_and(|user| api::names::same_user(user, sender_id))
+        {
+            return Some(if usable_quote_author(self.user_name) {
+                self.user_name.trim()
+            } else {
+                "You"
+            });
+        }
+        self.messages()
+            .rev()
+            .find(|message| {
+                api::names::same_user(&message.sender_id, sender_id)
+                    && usable_quote_author(&message.sender)
+            })
+            .map(|message| message.sender.trim())
+            .or_else(|| {
+                self.peer
+                    .filter(|(id, name)| {
+                        api::names::same_user(id, sender_id) && usable_quote_author(name)
+                    })
+                    .map(|(_, name)| name.trim())
+            })
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        author: Option<&'a str>,
+        author_id: Option<&str>,
+        message_id: Option<&str>,
+    ) -> Option<&'a str> {
+        if let Some(name) = author.filter(|name| usable_quote_author(name)) {
+            return Some(name.trim());
+        }
+        let author_id = author_id.filter(|id| !id.trim().is_empty());
+        if let Some(original) = message_id.and_then(|id| {
+            self.messages().find(|message| {
+                message.native_id.as_deref() == Some(id)
+                    && author_id
+                        .is_none_or(|author| api::names::same_user(author, &message.sender_id))
+            })
+        }) {
+            if let Some(name) = self.sender_name(&original.sender_id) {
+                return Some(name);
+            }
+            if usable_quote_author(&original.sender) {
+                return Some(original.sender.trim());
+            }
+        }
+        author_id.and_then(|id| self.sender_name(id))
+    }
+}
+
 /// Render a single message card (either top-level or reply) into the line buffer.
 ///
 /// Uses colored backgrounds instead of ASCII borders. Even/odd `msg_idx`
@@ -524,9 +599,10 @@ fn render_message_card(
     indent: usize,
     msg_idx: usize,
     today: NaiveDate,
-    user_name: &str,
-    current_user_id: Option<&str>,
+    authors: &MessageAuthors<'_>,
 ) {
+    let user_name = authors.user_name;
+    let current_user_id = authors.current_user_id;
     let is_own = current_user_id.is_some_and(|user| super::unread::same_user(user, &msg.sender_id));
     // Native messages sent by the CLI may omit imdisplayname. Resolve the
     // label at render time so identity arriving after history also repairs it.
@@ -661,7 +737,19 @@ fn render_message_card(
             }
             match block {
                 api::MessageBlock::Text(text) => body.text(text),
-                api::MessageBlock::Quote { author, text } => body.quote(author.as_deref(), text),
+                api::MessageBlock::Quote {
+                    author,
+                    author_id,
+                    message_id,
+                    text,
+                } => body.quote(
+                    authors.resolve(
+                        author.as_deref(),
+                        author_id.as_deref(),
+                        message_id.as_deref(),
+                    ),
+                    text,
+                ),
             }
             previous_quote = is_quote;
             has_content = true;
@@ -987,6 +1075,8 @@ mod tests {
                 content: "Plain search preview; never duplicate in the card".into(),
                 content_blocks: vec![
                     api::MessageBlock::Quote {
+                        author_id: None,
+                        message_id: None,
                         author: author.map(str::to_string),
                         text: quote.into(),
                     },
@@ -1004,6 +1094,111 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn quote_identity(
+        state: &mut MessagesState,
+        author_id: Option<&str>,
+        message_id: Option<&str>,
+    ) {
+        let api::MessageBlock::Quote {
+            author_id: id,
+            message_id: reference,
+            ..
+        } = &mut state.messages[0].content_blocks[0]
+        else {
+            panic!("expected a quote");
+        };
+        *id = author_id.map(str::to_owned);
+        *reference = message_id.map(str::to_owned);
+    }
+
+    fn quote_labels(state: &MessagesState, name: &str, user: Option<&str>) -> String {
+        build_message_lines(state, 100, name, user)
+            .0
+            .iter()
+            .map(line_text)
+            .filter(|line| line.contains('↪'))
+            .collect()
+    }
+
+    fn add_quote_source(state: &mut MessagesState, id: &str, sender_id: &str, sender: &str) {
+        let mut original = state.messages[0].clone();
+        original.id = id.into();
+        original.native_id = Some(id.into());
+        original.sender_id = sender_id.into();
+        original.sender = sender.into();
+        original.content_blocks.clear();
+        original.content = "Original message".into();
+        state.messages.push(original);
+    }
+
+    #[test]
+    fn placeholder_quote_author_resolves_exact_original_message() {
+        let mut state = quoted_message(Some("Display Name"), "Original message", "Reply");
+        quote_identity(&mut state, None, Some("original"));
+        add_quote_source(&mut state, "original", "8:orgid:alice", "Alice García");
+        let labels = quote_labels(&state, "Me", Some("me"));
+        assert!(labels.contains("↪ Alice García"));
+        assert!(!labels.contains("Display Name"));
+        assert!(!labels.contains("Jorge"));
+    }
+
+    #[test]
+    fn older_quote_resolves_by_identity_and_repairs_when_names_arrive() {
+        let mut state = quoted_message(Some(" display name "), "Original message", "Reply");
+        quote_identity(
+            &mut state,
+            Some("https://chat/contacts/8:orgid:ALICE"),
+            Some("not-loaded"),
+        );
+        assert!(quote_labels(&state, "Me", Some("me")).contains("↪ Quoted message"));
+        add_quote_source(&mut state, "newer-message", "orgid:alice", "Display Name");
+        assert!(quote_labels(&state, "Me", Some("me")).contains("↪ Quoted message"));
+        state.messages[1].sender = "Alice".into();
+        assert!(quote_labels(&state, "Me", Some("me")).contains("↪ Alice"));
+        assert_eq!(state.selected, 0);
+        let api::MessageBlock::Quote { author, .. } = &state.messages[0].content_blocks[0] else {
+            panic!("expected a quote");
+        };
+        assert_eq!(
+            author.as_deref(),
+            Some(" display name "),
+            "resolution must not freeze a derived name"
+        );
+    }
+
+    #[test]
+    fn own_quote_uses_account_identity_instead_of_the_peer_or_reply_sender() {
+        let mut state = quoted_message(Some("Display Name"), "My original", "Peer reply");
+        quote_identity(&mut state, Some("8:orgid:ME"), None);
+        state.quote_peer = Some(("8:orgid:alice".into(), "Alice".into()));
+        assert!(quote_labels(&state, "Loading...", None).contains("↪ Quoted message"));
+        assert!(quote_labels(&state, "Loading...", Some("me")).contains("↪ You"));
+        assert!(quote_labels(&state, "Víctor", Some("me")).contains("↪ Víctor"));
+        assert!(!quote_labels(&state, "Víctor", Some("me")).contains("Alice"));
+    }
+
+    #[test]
+    fn quote_identity_conflicts_and_synthetic_references_do_not_misattribute() {
+        let mut state = quoted_message(None, "Original", "Reply");
+        quote_identity(&mut state, Some("other"), Some("original"));
+        add_quote_source(&mut state, "original", "me", "My Name");
+        assert!(quote_labels(&state, "My Name", Some("me")).contains("↪ Jorge Martin la Pena"));
+        quote_identity(&mut state, None, Some("original"));
+        state.messages[1].native_id = None;
+        assert!(quote_labels(&state, "My Name", Some("me")).contains("↪ Quoted message"));
+        quote_identity(&mut state, Some("unknown"), None);
+        state.quote_peer = Some(("alice".into(), "Alice".into()));
+        assert!(quote_labels(&state, "My Name", Some("me")).contains("↪ Quoted message"));
+    }
+
+    #[test]
+    fn genuine_quote_authors_remain_authoritative() {
+        let mut state = quoted_message(Some("Original Author"), "Original", "Reply");
+        quote_identity(&mut state, Some("other"), Some("original"));
+        add_quote_source(&mut state, "original", "other", "New Name");
+        assert!(quote_labels(&state, "Me", Some("me")).contains("↪ Original Author"));
     }
 
     #[test]
@@ -1054,6 +1249,8 @@ mod tests {
         state.messages[0]
             .content_blocks
             .push(api::MessageBlock::Quote {
+                author_id: None,
+                message_id: None,
                 author: Some("   ".into()),
                 text: "Another quote".into(),
             });

@@ -559,6 +559,8 @@ mod live_message_tests {
             messages[1].content_blocks,
             vec![
                 super::super::MessageBlock::Quote {
+                    author_id: None,
+                    message_id: None,
                     author: Some("Alice".into()),
                     text: "Original".into()
                 },
